@@ -1,1140 +1,1382 @@
-# Copyright (c) 2024, EleutherAI
-# This file is based on code by the authors denoted below and has been modified from its original version.
-#
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# This file has been modified from its original version
-#
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
+
+import gc
+import dataclasses
 from datetime import datetime
-from functools import partial
-
 import math
-import sys
-
-import torch
-import deepspeed
-from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
-import numpy as np
-
-from megatron.utils import (
-    Timers,
-    init_wandb,
-    get_ltor_masks_and_position_ids,
-    reduce_losses,
-)
-
-from megatron import print_rank_0, mpu
-from megatron.model import (
-    GPT2ModelPipe,
-    SoftEmbedding,
-    get_params_for_weight_decay_optimization,
-)
-from megatron.checkpointing import load_checkpoint, save_checkpoint
-from megatron.data.data_utils import build_train_valid_test_data_iterators
-from megatron.initialize import initialize_megatron
-from megatron.learning_rates import AnnealingLR
-from megatron.logging import tb_wandb_log, training_log
-from megatron.utils import (
-    OverflowMonitor,
-    get_noise_scale_logger,
-    get_total_params,
-    CharCounter,
-)
-from megatron.model.gpt2_model import cross_entropy
-
-from pickle import dump
+import logging
 import os
+import sys
+from .log_handler import CustomHandler
+# Make default logging level INFO, but filter out all log messages not from MCore.
+logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
+from .theoretical_memory_usage import report_theoretical_memory
+import time
+# The earliest we can measure the start time.
+_TRAIN_START_TIME = time.time()
+import torch
+
+from megatron import get_args
+from megatron import get_signal_handler
+from megatron import get_timers
+from megatron import get_tensorboard_writer
+from megatron import get_wandb_writer
+from megatron import get_one_logger
+from megatron import get_current_global_batch_size
+from megatron import get_num_microbatches
+from megatron import is_last_rank
+from megatron import update_num_microbatches
+from megatron.core import mpu, tensor_parallel
+from megatron.core.utils import get_model_config
+from megatron import print_rank_0
+from megatron import print_rank_last
+from megatron.checkpointing import load_checkpoint
+from megatron.checkpointing import save_checkpoint
+from megatron.model import Float16Module
+from megatron.model import GPTModel
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import finalize_model_grads
+from megatron.core.enums import ModelType
+from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.initialize import initialize_megatron
+from megatron.initialize import write_args_to_tensorboard
+from megatron.initialize import set_jit_fusion_options
+from megatron.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import unwrap_model
+from megatron.data.data_samplers import build_pretraining_data_loader
+from megatron.utils import calc_params_l2_norm
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.utils import report_memory
+from megatron.model.vision.knn_monitor import compute_feature_bank
 
 
-def mup_weights_reinit(neox_args, model):
-    def has_method(o, name):
-        return callable(getattr(o, name, None))
-
-    for layer in model.modules():
-        # This normally would happen in set_base_shapes if we actually were able to use the MuReadout class
-        if hasattr(layer, "mup_rescale_parameters") and layer.mup_rescale_parameters:
-            layer._rescale_parameters()
-
-        if has_method(layer, "mup_reinitialize_weights"):
-            layer.mup_reinitialize_weights(neox_args)
+def print_datetime(string):
+    """Note that this call will sync across all ranks."""
+    torch.distributed.barrier()
+    time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
-def save_base_shapes(neox_args, base_shapes, use_cache):
-
-    # Instantiation of the base model fails in the init function (init_functions.py) because we haven't called set_base_shapes on it at this point, so disable it temporarily here
-    neox_args.use_mup = False
-
-    base_model = GPT2ModelPipe(
-        neox_args=neox_args,
-        num_tokentypes=0,
-        parallel_output=True,
-        topology=mpu.get_topology(),
-        use_cache=use_cache,
+def num_floating_point_operations(args, batch_size):
+    if not args.group_query_attention:
+        args.num_query_groups = args.num_attention_heads
+    return (
+        60
+        * batch_size
+        * args.seq_length
+        * args.num_layers
+        * args.hidden_size
+        * args.hidden_size
+        * (
+            ((1 + (args.ffn_hidden_size / args.hidden_size)) / 5.0)
+            + (args.num_query_groups / (5 * args.num_attention_heads))
+            + (args.seq_length / (5 * args.hidden_size))
+            + (args.padded_vocab_size / (10 * args.num_layers * args.hidden_size))
+        )
     )
 
-    if not neox_args.is_pipe_parallel:
-        base_model = base_model.to_sequential()
 
-    try:
-        import mup
-    except ModuleNotFoundError:
-        print("Please install mup https://github.com/microsoft/mup")
-        raise Exception
-
-    base_shapes = mup.get_shapes(base_model)
-
-    del base_model
-
-    old_hidden_size = neox_args.hidden_size
-    neox_args.hidden_size = neox_args.hidden_size * neox_args.mup_width_scale
-
-    delta_model = GPT2ModelPipe(
-        neox_args=neox_args,
-        num_tokentypes=0,
-        parallel_output=True,
-        topology=mpu.get_topology(),
-        use_cache=use_cache,
-    )
-
-    if not neox_args.is_pipe_parallel:
-        delta_model = delta_model.to_sequential()
-
-    delta_shapes = mup.get_shapes(delta_model)
-
-    # change back
-    neox_args.use_mup = True
-    neox_args.hidden_size = old_hidden_size
-
-    save_shapes = f"{neox_args.base_shapes_file}.{torch.distributed.get_rank()}"
-    print(f"saving base shapes at {save_shapes}")
-    mup.make_base_shapes(base_shapes, delta_shapes, savefile=save_shapes)
-    print(f"base shapes saved...exiting")
-    sys.exit(1)
+def append_to_progress_log(string):
+    args = get_args()
+    if args.save is None:
+        return
+    progress_log_filename = os.path.join(args.save, "progress.txt")
+    torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0:
+        with open(progress_log_filename, 'a') as f:
+            job_id = os.getenv('SLURM_JOB_ID', '')
+            num_gpus = args.world_size
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
+                    f"# GPUs: {num_gpus}\t{string}\n")
 
 
-def mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator):
-    from megatron.mup_substitute import get_coord_data
-    from mup.coord_check import plot_coord_data
+def get_start_time_from_progress_log():
+    """
+    Gets start time of earliest job with same world size. Also returns the number
+    of floating-point operations completed in last saved checkpoint.
+    """
+    args = get_args()
+    assert args.save is not None
+    progress_log_filename = os.path.join(args.save, "progress.txt")
 
-    def lazy_model(hidden_size):
-        def gen():
-            old_hidden_size = neox_args.hidden_size
-            neox_args.hidden_size = hidden_size
+    # start_time is time when job with same world size started.
+    # start_num_floating_point_operations is the number of floating-point operations
+    # completed when this job started.
+    # latest_num_floating_point_operations is the number of floating-point operations
+    # completed in most recent saved checkpoint.
+    start_time = None
+    start_num_floating_point_operations = None
+    latest_num_floating_point_operations = 0
 
-            model, optimizer, _ = setup_model_and_optimizer(
-                neox_args=neox_args, use_cache=False
-            )
+    def _get_field(string, type):
+        return type(string.split(': ')[1])
 
-            neox_args.hidden_size = old_hidden_size
-
-            return model
-
-        return gen
-
-    models = {}
-
-    # Hidden size needs to be divisible by num attention heads
-    for hidden_size in (neox_args.num_attention_heads * (2**p) for p in range(2, 9)):
-        models[hidden_size] = lazy_model(hidden_size)
-
-    neox_args.use_mup = True
-    df_up = get_coord_data(
-        neox_args, timers, lr_scheduler, models, train_data_iterator, mup=True
-    )
-    neox_args.use_mup = False
-    df_sp = get_coord_data(
-        neox_args, timers, lr_scheduler, models, train_data_iterator, mup=False
-    )
-
-    plot_coord_data(df_up, save_to=f"coord_check_up.{torch.distributed.get_rank()}.jpg")
-    plot_coord_data(df_sp, save_to=f"coord_check_sp.{torch.distributed.get_rank()}.jpg")
-
-    print_rank_0("Saved coord check plots... exiting")
-    sys.exit(1)
+    with open(progress_log_filename, 'r') as f:
+        for line in f:
+            line = line.strip()
+            line_tokens = line.split('\t')
+            world_size_in_line = _get_field(line_tokens[2], int)
+            if line_tokens[3] == "Saved checkpoint":
+                latest_num_floating_point_operations = \
+                    _get_field(line_tokens[7], float)
+            if world_size_in_line != args.world_size:
+                # Re-start search if we see a different world size.
+                start_time = None
+                start_num_floating_point_operations = None
+                continue
+            if line_tokens[3] == "Starting job":
+                if start_time is None:
+                    start_time = line_tokens[0]
+                    start_num_floating_point_operations = \
+                        latest_num_floating_point_operations
+    assert start_time is not None and start_num_floating_point_operations is not None, \
+        "Should have seen at least one 'Starting job' entry with same world_size"
+    return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), \
+        start_num_floating_point_operations
 
 
-def pretrain(neox_args):
+def pretrain(train_valid_test_dataset_provider,
+             model_provider,
+             model_type,
+             forward_step_func,
+             process_non_loss_data_func=None,
+             extra_args_provider=None,
+             args_defaults={}):
     """Main training program.
 
-    This function will run the following in the order provided:
+    This function will run the followings in the order provided:
         1) initialize Megatron.
-        2) setup model, optimizer and lr schedule
+        2) setup model, optimizer and lr schedule using the model_provider.
         3) call train_val_test_data_provider to get train/val/test datasets.
-        4) train the model.
+        4) train the modle using the forward_step_func.
 
     Arguments:
-        neox_args: an instance of NeoXArgs containing the configuration for pretrain
-
+        train_valid_test_dataset_provider: a function that takes the size of
+            train/valid/test dataset and returns `train, valid, test` datasets.
+        model_provider: a function that returns a vanilla version of the
+            model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
+        model_type: an enum that specifies the type of model being trained.
+        forward_step_func: a function that takes a `data iterator` and `model`,
+            and returns a `loss` scalar with a dictionary with key:values being
+            the info we would like to monitor during training, for example
+            `lm-loss: value`. We also require that this function add
+            `batch generator` to the timers class.
+        process_non_loss_data_func: a function to post process outputs of the
+            network. It can be used for dumping output tensors (e.g images) to
+            tensorboard. It takes `collected data`(list of tensors),
+            `current iteration index` and `tensorboard writer` as arguments.
+        extra_args_provider: a function that takes a parser and adds arguments
+            to it. It is used for programs to add their own arguments.
+        args_defaults: a dictionary from argument-name to argument-value. It
+            to set already parse arguments.
     """
-    # setup logging and timers
-    init_wandb(neox_args=neox_args)
-    timers = Timers(
-        use_wandb=neox_args.use_wandb, tensorboard_writer=neox_args.tensorboard_writer
-    )
 
-    # Initialize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(neox_args=neox_args)
+    # Initalize and get arguments, timers, and Tensorboard writer.
+    initialize_megatron(extra_args_provider=extra_args_provider,
+                        args_defaults=args_defaults)
+
+    args = get_args()
+    timers = get_timers()
+
+    if args.log_progress:
+        append_to_progress_log("Starting job")
+
+    # Set pytorch JIT layer fusion options and warmup JIT functions.
+    set_jit_fusion_options()
+
+    # Adjust the startup time so it reflects the largest value.
+    # This will be closer to what scheduler will see (outside of
+    # image ... launches.
+    global _TRAIN_START_TIME
+    start_time_tensor = torch.tensor([_TRAIN_START_TIME],
+                                     dtype=torch.double,
+                                     device='cuda')
+    torch.distributed.all_reduce(start_time_tensor,
+                                 op=torch.distributed.ReduceOp.MIN)
+    _TRAIN_START_TIME = start_time_tensor.item()
+    print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
+        time.time() - _TRAIN_START_TIME))
+    print_datetime('after megatron is initialized')
+
+    args = get_args()
+    timers = get_timers()
+
+    one_logger = get_one_logger()
+    if one_logger:
+        one_logger.log_metrics({
+            'train_iterations_warmup': 5
+        })
 
     # Model, optimizer, and learning rate.
-    timers("model and optimizer").start()
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(
-        neox_args=neox_args, use_cache=False, iteration=neox_args.iteration
-    )
-    timers("model and optimizer").stop()
+    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+        model_provider, model_type)
+
+    timers('model-and-optimizer-setup').stop()
+    print_datetime('after model, optimizer, and learning rate '
+                   'scheduler are built')
+    config = get_model_config(model[0])
 
     # Data stuff.
-    timers("train/valid/test data iterators").start()
-    (
-        train_data_iterator,
-        valid_data_iterator,
-        test_data_iterator,
-    ) = build_train_valid_test_data_iterators(neox_args=neox_args)
-    timers("train/valid/test data iterators").stop()
-
-    if neox_args.use_mup and neox_args.coord_check:
-        mup_coord_check(neox_args, timers, lr_scheduler, train_data_iterator)
+    timers('train/valid/test-data-iterators-setup', log_level=0).start(
+        barrier=True)
+    if args.virtual_pipeline_model_parallel_size is not None:
+        train_data_iterator = []
+        valid_data_iterator = []
+        test_data_iterator = []
+        for i in range(len(model)):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            iterators = build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider)
+            train_data_iterator.append(iterators[0])
+            valid_data_iterator.append(iterators[1])
+            test_data_iterator.append(iterators[2])
+    else:
+        train_data_iterator, valid_data_iterator, test_data_iterator \
+            = build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider)
+    timers('train/valid/test-data-iterators-setup').stop()
+    print_datetime('after dataloaders are built')
 
     # Print setup timing.
-    print_rank_0("done with setups ...")
-    timers.log(["model and optimizer", "train/valid/test data iterators"])
-    print_rank_0("training ...")
+    print_rank_0('done with setup ...')
+    timers.log(['model-and-optimizer-setup',
+                'train/valid/test-data-iterators-setup'], barrier=True)
 
-    iteration = neox_args.iteration
-    # edge case: save step 0 checkpoint if requested and we're starting from step 0
-    if neox_args.save and 0 in neox_args.save_iters and iteration == 0:
-        save_checkpoint(
-            neox_args=neox_args,
-            iteration=iteration,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-        )
+    if not args.skip_train:
+        print_rank_0('training ...')
 
-    if neox_args.do_train and neox_args.train_iters > 0:
-        iteration = train(
-            neox_args=neox_args,
-            timers=timers,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            train_data_iterator=train_data_iterator,
-            valid_data_iterator=valid_data_iterator,
-        )
+        if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
+            args.train_iters = args.retro_cyclic_train_iters
+            print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
-    if neox_args.do_valid:
-        prefix = "the end of training for val data"
-        evaluate_and_print_results(
-            neox_args=neox_args,
-            prefix=prefix,
-            forward_step_func=forward_step,
-            data_iterator=valid_data_iterator,
-            model=model,
-            iteration=iteration,
-            verbose=False,
-            timers=timers,
-        )
+        iteration = 0
+        if args.do_train and args.train_iters > 0:
+            iteration, num_floating_point_operations_so_far = train(
+                forward_step_func,
+                model, optimizer, opt_param_scheduler,
+                train_data_iterator, valid_data_iterator,
+                process_non_loss_data_func, config)
 
-    if neox_args.save and iteration != 0:
-        save_checkpoint(
-            neox_args=neox_args,
-            iteration=iteration,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-        )
+        print_datetime('after training is done')
 
-    if neox_args.do_test:
-        # Run on test data.
-        prefix = "the end of training for test data"
-        evaluate_and_print_results(
-            neox_args=neox_args,
-            prefix=prefix,
-            forward_step_func=forward_step,
-            data_iterator=test_data_iterator,
-            model=model,
-            iteration=iteration,
-            verbose=True,
-            timers=timers,
-            chart_name="test",
-        )
-
-
-def _get_batch(neox_args, tokenizer, keys, data, datatype):
-    """Support function for get_batch / get_batch pipe (to avoid code repetition)"""
-    data_b = mpu.broadcast_data(keys, data, datatype)
-
-    # Unpack.
-    tokens_ = data_b["text"].long()
-    if "label" in data_b:
-        labels = torch.where(
-            data_b["label"].long() >= 0,
-            data_b["label"].long(),
-            torch.zeros_like(data_b["label"].long()),
-        )[:, 1:].contiguous()
+        if args.save and iteration != 0:
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
+                            num_floating_point_operations_so_far)
     else:
-        labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+        print_rank_0('skipping training (--skip-train is on) ...')
 
-    # Get the masks and position ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        data=tokens,
-        eod_token=neox_args.tokenizer.eod,
-        eod_mask_loss=neox_args.eod_mask_loss,
-        sliding_window_width=neox_args.sliding_window_width,
-    )
-    # If `label` is present, any token < 0 (e.g., -100, the default for torch) skips the loss computation
-    if "label" in data_b:
-        loss_mask = (data_b["label"][:, 1:] >= 0).to(loss_mask.dtype)
-    return tokens, labels, loss_mask, attention_mask, position_ids
+        iteration = args.iteration
+
+    if args.do_valid:
+        prefix = f'iteration {iteration} on validation set'
+        evaluate_and_print_results(prefix, forward_step_func,
+                                   valid_data_iterator, model,
+                                   iteration, process_non_loss_data_func, config,
+                                   verbose=True, write_to_tensorboard=not args.skip_train)
+
+    if args.do_test:
+        prefix = f'iteration {iteration} on test set'
+        evaluate_and_print_results(prefix, forward_step_func,
+                                   test_data_iterator, model,
+                                   iteration, process_non_loss_data_func, config,
+                                   verbose=True, write_to_tensorboard=not args.skip_train)
 
 
-def get_batch(neox_args, data_iterator):
-    """Generate a batch"""
 
-    # Items and their type.
-    keys = ["text", "label"] if neox_args.label_data_paths else ["text"]
-    datatype = torch.int64
+def update_train_iters(args):
 
-    # Broadcast data.
-    if data_iterator is not None:
-        data = next(data_iterator)
+    # For iteration-based training, we don't need to do anything
+    if args.train_iters:
+        return
+
+    # Constant batch size with sample-based training.
+    if args.rampup_batch_size is None:
+        args.train_iters = args.train_samples // args.global_batch_size
+
     else:
-        data = None
-    return _get_batch(
-        neox_args=neox_args,
-        tokenizer=neox_args.tokenizer,
-        keys=keys,
-        data=data,
-        datatype=datatype,
-    )
+        # Sample based training with rampup batch size.
+        iterations = 0
+        consumed_samples = 0
+        # Rampup phase.
+        while consumed_samples <= int(args.rampup_batch_size[2]):
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
+            iterations += 1
+        # Reset
+        update_num_microbatches(0, consistency_check=False)
+        # Constant phase
+        # Note that we throw away any partial last batch.
+        iterations += (args.train_samples - consumed_samples) // \
+                      args.global_batch_size
+        args.train_iters = iterations
+
+    print_rank_0('setting training iterations to {}'.format(args.train_iters))
 
 
-def get_batch_pipe(data, neox_args, curr_scheduler=None):
-    """A modification of get_batch() to work with the latest batch instead of an iterator."""
-    # Items and their type.
-    keys = ["text", "label"] if neox_args.label_data_paths else ["text"]
-    datatype = torch.int64
-
-    tokens, labels, loss_mask, attention_mask, position_ids = _get_batch(
-        neox_args, neox_args.tokenizer, keys, data, datatype
-    )
-    if curr_scheduler is not None:
-        # iteration + 1 to align with how/when DeepSpeed updates the buffers
-        curriculum_seqlen = curr_scheduler.update_difficulty(neox_args.iteration + 1)
-        if curriculum_seqlen < tokens.size()[1]:
-            # seqlen-based curriculum learning
-            # input_ids, position_ids, labels have size [batch size, seqlen]
-            # input_ids = input_ids[:, :curriculum_seqlen].contiguous()
-            tokens = tokens[:, :curriculum_seqlen].contiguous()
-            position_ids = position_ids[:, :curriculum_seqlen].contiguous()
-            if labels is not None:
-                labels = labels[:, :curriculum_seqlen].contiguous()
-            if loss_mask is not None:
-                loss_mask = loss_mask[:, :curriculum_seqlen].contiguous()
-            # attention_mask has size [1, 1, seqlen, seqlen]
-            attention_mask = attention_mask[
-                :, :, :curriculum_seqlen, :curriculum_seqlen
-            ].contiguous()
-
-    # unpack data
-    return (tokens, position_ids, attention_mask), (labels, loss_mask)
-
-
-def get_batch_sequential(forward_input, neox_args):
-    """A modification of get_batch() to work with the latest batch instead of an iterator."""
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        data=forward_input[0],
-        eod_token=neox_args.tokenizer.eod,
-        eod_mask_loss=neox_args.eod_mask_loss,
-    )
-    return (forward_input[0], forward_input[1], attention_mask)
-
-
-def forward_step(
-    data_iterator, model, neox_args, timers, return_logits=False, is_train=False
-):
-    """Forward step."""
-    if neox_args.is_pipe_parallel:
-        return model.eval_batch(data_iterator, return_logits=return_logits)
-
-    # Get the batch.
-    if neox_args.memory_profiling and neox_args.it:
-        torch.cuda.nvtx.range_push(f"Get batch")
-    if timers is not None:
-        timers("batch generator").start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        neox_args=neox_args, data_iterator=data_iterator
-    )
-
-    if timers is not None:
-        timers("batch generator").stop()
-    if neox_args.memory_profiling:
-        torch.cuda.nvtx.range_pop()
-
-    if neox_args.memory_profiling:
-        torch.cuda.nvtx.range_push(f"Forward pass")
-    # Sequential returns moe_losses, but this is not yet supported by pipe parallel
-    maybe_tuple = model((tokens, position_ids, attention_mask), neox_args=neox_args)
-    if type(maybe_tuple) is tuple:
-        outputs, moe_losses = maybe_tuple
-    else:
-        outputs = maybe_tuple
-        moe_losses = []
-    if (
-        is_train
-        and neox_args.curriculum_learning
-        and neox_args.curriculum_seqlen < neox_args.seq_length
-    ):
-        loss_mask = loss_mask[:, : neox_args.curriculum_seqlen].contiguous()
-        labels = labels[:, : neox_args.curriculum_seqlen].contiguous()
-    main_loss = cross_entropy(
-        outputs, (labels, loss_mask), _fp16=neox_args.fp16_lm_cross_entropy
-    )
-    if neox_args.num_experts > 1:
-        moe_loss = neox_args.moe_loss_coeff * sum(m.item() for m in moe_losses)
-    else:
-        moe_loss = 0.0
-    loss = main_loss + moe_loss
-    if neox_args.memory_profiling:
-        torch.cuda.nvtx.range_pop()
-    if return_logits:
-        return loss, outputs
-    return loss
-
-
-def get_model(neox_args, use_cache=False):
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
     """Build the model."""
+    args = get_args()
+    args.model_type = model_type
 
-    # Build model on cpu.
-    print_rank_0("building GPT2 model ...")
-
-    # Temporarily disable mup so that the base model does not use the mup init functions before set_base_shapes is called below.
-    # If mup isn't being used anyways, this has no effect.
-    old_use_mup = neox_args.use_mup
-    neox_args.use_mup = False
-    model = GPT2ModelPipe(
-        neox_args=neox_args,
-        num_tokentypes=0,
-        parallel_output=True,
-        topology=mpu.get_topology(),
-        use_cache=use_cache,
-    )
-
-    ### soft prompt tuning stuff ###
-    if neox_args.soft_prompt_tuning is not None and neox_args.soft_prompt_tuning.get(
-        "enabled", False
-    ):
-        soft_prompt = SoftEmbedding(
-            neox_args,
-            wte=getattr(model, "0").word_embeddings,
-            n_tokens=neox_args.soft_prompt_tuning.get("n_tokens", 10),
-            init_string=neox_args.soft_prompt_tuning.get("init_string", ""),
-            init_range=neox_args.soft_prompt_tuning.get("init_range", 0.5),
-        )
-        model.insert_layers(
-            layers=soft_prompt, idx=1
-        )  # insert the soft prompt layer directly after the word embeddings
-
-        # freeze everything but the soft prompt
-        for name, param in model.named_parameters():
-            if not "soft_embedding" in name:
-                param.requires_grad = False
-
-    if not neox_args.is_pipe_parallel:
-        # Export PipeParallel model to nn.Sequential model to avoid the overhead of deepspeed's pipe parallel training
-        model = model.to_sequential()
-
-    neox_args.use_mup = old_use_mup
-
-    if neox_args.use_mup:
-        try:
-            import mup
-        except ModuleNotFoundError:
-            print("Please install mup https://github.com/microsoft/mup")
-            raise Exception
-
-        base_shapes = f"{neox_args.base_shapes_file}.{torch.distributed.get_rank()}"
-
-        if neox_args.save_base_shapes:
-            save_base_shapes(neox_args, base_shapes, use_cache)
-
-        mup.set_base_shapes(model, base_shapes)
-
-        # Call the mup replacement init functions on the model now that set_base_shapes has given each weight a .infshape attribute
-        mup_weights_reinit(neox_args, model)
-
-    if neox_args.deepspeed:
-        # DeepSpeed handles CUDA, FP16, and DDP components.
-        return model
+    # Build model.
+    if mpu.get_pipeline_model_parallel_world_size() > 1 and \
+       args.virtual_pipeline_model_parallel_size is not None:
+        assert model_type != ModelType.encoder_and_decoder, \
+            "Interleaved schedule not supported for model with both encoder and decoder"
+        model = []
+        for i in range(args.virtual_pipeline_model_parallel_size):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            # Set pre_process and post_process only after virtual rank is set.
+            pre_process = mpu.is_pipeline_first_stage()
+            post_process = mpu.is_pipeline_last_stage()
+            this_model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process
+            )
+            this_model.model_type = model_type
+            model.append(this_model)
     else:
-        raise ValueError("Must be using deepspeed to run neox")
-
-
-def get_optimizer(model, neox_args):
-    """Set up the optimizer."""
-    if neox_args.no_load_optim:
-        return None, None
-
-    if neox_args.optimizer is None:
-        print_rank_0(
-            f"ERROR: Optimizer is None. Either set the optimizer dict in your config (if training) or set no_load_optim in your config (if inference)"
-        )
-        exit()
-    # Build parameter groups (weight decay and non-decay).
-    param_groups = get_params_for_weight_decay_optimization(model, neox_args)
-    print_rank_0(
-        f'Configuring Optimizer type: {neox_args.optimizer_type} with params: {neox_args.optimizer["params"]}'
-    )
-
-    if neox_args.create_moe_param_group:
-        from deepspeed.moe.utils import (
-            is_moe_param,
-            split_params_into_different_moe_groups_for_optimizer,
-        )
-
-        param_groups = split_params_into_different_moe_groups_for_optimizer(
-            param_groups
-        )
-
-    # Add model parallel attribute if it is not set.
-    for param_group in param_groups:
-        for param in param_group["params"]:
-            if not hasattr(param, "model_parallel"):
-                param.model_parallel = False
-
-    # Filter out params that don't require a grad (for soft prompt tuning, etc.)
-    _param_groups = []
-    for param_group in param_groups:
-        trainable_params = [p for p in param_group["params"] if p.requires_grad]
-        param_group["params"] = trainable_params
-        _param_groups.append(param_group)
-    param_groups = _param_groups
-
-    # If we're using mup, then the optimizer must be adam or sgd
-    assert not neox_args.use_mup or (
-        neox_args.optimizer_type.lower() == "adam"
-        or neox_args.optimizer_type.lower() == "sgd"
-    ), f"If use_mup == True, you must specify either the adam or sgd optimizers. You passed: {neox_args.optimizer_type.lower()}"
-
-    if neox_args.optimizer_type.lower() in ["cpu_adam", "cpu_torch_adam"]:
-        if neox_args.optimizer == "cpu_torch_adam":
-            cpu_adam_optimizer = torch.optim.Adam
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
+        add_encoder = True
+        add_decoder = True
+        if model_type == ModelType.encoder_and_decoder:
+            if mpu.get_pipeline_model_parallel_world_size() > 1:
+                assert args.pipeline_model_parallel_split_rank is not None, \
+                    "Split rank needs to be specified for model with both encoder and decoder"
+                rank = mpu.get_pipeline_model_parallel_rank()
+                split_rank = args.pipeline_model_parallel_split_rank
+                world_size = mpu.get_pipeline_model_parallel_world_size()
+                pre_process = rank == 0 or rank == split_rank
+                post_process = (rank == (split_rank - 1)) or (
+                        rank == (world_size - 1))
+                add_encoder = mpu.is_pipeline_stage_before_split()
+                add_decoder = mpu.is_pipeline_stage_after_split()
+            model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process,
+                add_encoder=add_encoder,
+                add_decoder=add_decoder)
         else:
-            from deepspeed.ops.adam import DeepSpeedCPUAdam
+            model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process
+            )
+        model.model_type = model_type
 
-            cpu_adam_optimizer = DeepSpeedCPUAdam
-        optimizer = cpu_adam_optimizer(
-            param_groups,
-            weight_decay=neox_args.weight_decay,
-            **neox_args.optimizer["params"],
-        )
-    elif neox_args.optimizer_type.lower() == "onebitadam":
-        assert neox_args.deepspeed
-        optimizer = None
-        # onebitadam needs to be instantiated within the deepspeed engine to work :|
-    elif neox_args.optimizer_type.lower() == "sm3":
-        from .optimizers import SM3
+    if not isinstance(model, list):
+        model = [model]
 
-        optimizer = SM3(param_groups, **neox_args.optimizer["params"])
-    elif neox_args.optimizer_type.lower() == "madgrad_wd":
-        from .optimizers import madgrad_wd
+    # Disallow training and inference with Transformer Engine
+    # for non-GPT models
+    args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
+    # assert args.allow_transformer_engine or args.transformer_impl == 'local', \
+    #     'Transformer Engine is only approved for GPT models'
 
-        optimizer = madgrad_wd(
-            param_groups,
-            weight_decay=neox_args.weight_decay,
-            **neox_args.optimizer["params"],
-        )
-    elif neox_args.optimizer_type.lower() == "lion":
-        # if we want the deepspeed zero lion...megatron lion will throw DeepSpeed Error
-        if neox_args.zero_optimization["stage"] != 0:
-            from deepspeed.ops.lion import FusedLion
+    # Set tensor model parallel attributes if not set.
+    # Only parameters that are already tensor model parallel have these
+    # attributes set for them. We should make sure the default attributes
+    # are set for all params so the optimizer can use them.
+    for model_module in model:
+        for param in model_module.parameters():
+            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
-            lion_optimizer = FusedLion
-        # if not zero
-        else:
-            from .optimizers import Lion
+    # Print number of parameters.
+    if mpu.get_data_parallel_rank() == 0:
+        print(' > number of parameters on (tensor, pipeline) '
+              'model parallel rank ({}, {}): {}'.format(
+            mpu.get_tensor_model_parallel_rank(),
+            mpu.get_pipeline_model_parallel_rank(),
+            sum([sum([p.nelement() for p in model_module.parameters()])
+                 for model_module in model])), flush=True)
 
-            lion_optimizer = Lion
+    # GPU allocation.
+    for model_module in model:
+        model_module.cuda(torch.cuda.current_device())
 
-        optimizer = lion_optimizer(
-            param_groups,
-            weight_decay=neox_args.weight_decay,
-            **neox_args.optimizer["params"],
-        )
-    elif neox_args.optimizer_type.lower() == "adam":
-        # Use Adam
-        if neox_args.use_mup:
-            try:
-                from mup import MuAdam
+    # Fp16 conversion.
+    if args.fp16 or args.bf16:
+        model = [Float16Module(model_module, args) for model_module in model]
 
-                adam_optimizer = MuAdam
-            except ModuleNotFoundError:
-                print("Please install mup https://github.com/microsoft/mup")
-                raise Exception
-        else:
-            if neox_args.use_bnb_optimizer:
-                try:
-                    import bitsandbytes as bnb
+    if wrap_with_ddp:
+        config = get_model_config(model[0])
+        model = [DDP(config,
+                     model_chunk,
+                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                     expert_data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
+                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+                     overlap_grad_reduce=args.overlap_grad_reduce,
+                     use_distributed_optimizer=args.use_distributed_optimizer,
+                     # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                     # model chunks is overlapped with compute anyway.
+                     disable_bucketing=(model_chunk_idx > 0),
+                     check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad)
+                 for (model_chunk_idx, model_chunk) in enumerate(model)]
 
-                    adam_optimizer = bnb.optim.Adam8bit
-                except ModuleNotFoundError:
-                    print(
-                        "Please install bitsandbytes following https://github.com/facebookresearch/bitsandbytes."
-                    )
-                    raise Exception
-            else:
-                try:
-                    # default to apex as it's slightly faster
-                    from apex.optimizers import FusedAdam as Adam
-                except ImportError:
-                    # if apex isn't installed, use deepspeed's FusedAdam
-                    print(
-                        "WARNING: APEX not installed - defaulting to deepspeed's fused adam"
-                    )
-                    from deepspeed.ops.adam import FusedAdam as Adam
-                adam_optimizer = Adam
-        optimizer = adam_optimizer(
-            param_groups,
-            weight_decay=neox_args.weight_decay,
-            **neox_args.optimizer["params"],
-        )
-    elif neox_args.optimizer_type.lower() == "sgd":
-        try:
-            from mup import MuSGD
-        except ModuleNotFoundError:
-            print("Please install mup https://github.com/microsoft/mup")
-            raise Exception
-        optimizer = MuSGD(
-            param_groups,
-            weight_decay=neox_args.weight_decay,
-            **neox_args.optimizer["params"],
-        )
-    else:
-        raise ValueError(f"Optimizer type {neox_args.optimizer_type} not recognized")
+        # Broadcast params from data parallel src rank to other data parallel ranks.
+        if args.data_parallel_random_init:
+            for model_module in model:
+                model_module.broadcast_params()
 
-    if neox_args.deepspeed:
-        # fp16 wrapper is not required for DeepSpeed.
-        return optimizer, param_groups
-    else:
-        raise ValueError("Must be using deepspeed to run neox")
+    return model
 
 
-def get_learning_rate_scheduler(optimizer, neox_args):
+def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
-    if neox_args.no_load_optim:
-        # TODO: this should be configured as a separate arg
-        return None
-    if neox_args.deepspeed and neox_args.optimizer_type.lower() == "onebitadam":
-        print_rank_0(
-            "WARNING: onebitadam requires the lr scheduler be built by deepspeed - "
-            "Make sure one is added to your deepspeed config"
-        )
-        return None
+    args = get_args()
 
-    # Add linear learning rate scheduler.
-    if neox_args.lr_decay_iters is not None:
-        num_iters = neox_args.lr_decay_iters
+    # Iteration-based training.
+    if args.train_iters:
+        if args.lr_decay_iters is None:
+            args.lr_decay_iters = args.train_iters
+        lr_decay_steps = args.lr_decay_iters * args.global_batch_size
+        wd_incr_steps = args.train_iters * args.global_batch_size
+        if args.lr_warmup_fraction is not None:
+            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
+        else:
+            lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
+    # Sample-based training.
+    elif args.train_samples:
+        # We need to set training iters for later use. Technically
+        # we need to adjust the training samples too (due to last
+        # batch being incomplete) but we leave it as is for now.
+        update_train_iters(args)
+        if args.lr_decay_samples is None:
+            args.lr_decay_samples = args.train_samples
+        lr_decay_steps = args.lr_decay_samples
+        wd_incr_steps = args.train_samples
+        if args.lr_warmup_fraction is not None:
+            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
+        else:
+            lr_warmup_steps = args.lr_warmup_samples
     else:
-        num_iters = neox_args.train_iters
-    num_iters = max(1, num_iters)
-    init_step = 0
-    warmup_iter = neox_args.warmup * num_iters
-    lr_scheduler = AnnealingLR(
+        raise Exception(
+            'either train-iters or train-samples should be provided.')
+
+    opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
-        start_lr=neox_args.lr,
-        warmup_iter=warmup_iter,
-        total_iters=num_iters,
-        decay_style=neox_args.lr_decay_style,
-        last_iter=init_step,
-        min_lr=neox_args.min_lr,
-        use_checkpoint_lr_scheduler=neox_args.use_checkpoint_lr_scheduler,
-        override_lr_scheduler=neox_args.override_lr_scheduler,
-        use_mup=neox_args.use_mup,
-    )
+        init_lr=args.lr_warmup_init,
+        max_lr=args.lr,
+        min_lr=args.min_lr,
+        lr_warmup_steps=lr_warmup_steps,
+        lr_decay_steps=lr_decay_steps,
+        lr_decay_style=args.lr_decay_style,
+        start_wd=args.start_weight_decay,
+        end_wd=args.end_weight_decay,
+        wd_incr_steps=wd_incr_steps,
+        wd_incr_style=args.weight_decay_incr_style,
+        use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
+        override_opt_param_scheduler=args.override_opt_param_scheduler)
 
-    return lr_scheduler
+    return opt_param_scheduler
 
 
-def setup_model_and_optimizer(neox_args, use_cache=False, iteration=None):
-    """Setup memory profiler"""
-    if neox_args.memory_profiling:
-        torch.cuda.memory._record_memory_history(
-            True,
-            # keep a maximum 100,000 alloc/free events from before the snapshot
-            trace_alloc_max_entries=100000,
-            trace_alloc_record_context=True,
-        )
-
+def setup_model_and_optimizer(model_provider_func,
+                              model_type,
+                              no_wd_decay_cond=None,
+                              scale_lr_cond=None,
+                              lr_mult=1.0):
     """Setup model and optimizer."""
-    model = get_model(neox_args=neox_args, use_cache=use_cache)
-    optimizer, param_groups = get_optimizer(model=model, neox_args=neox_args)
-    lr_scheduler = get_learning_rate_scheduler(optimizer=optimizer, neox_args=neox_args)
+    args = get_args()
 
-    if neox_args.deepspeed:
-        print_rank_0("DeepSpeed is enabled.")
-        if neox_args.no_load_optim:
-            assert optimizer is None
-            _model_params = None
-            _lr_scheduler = None
-        else:
-            _model_params = param_groups if optimizer is None else None
-            _lr_scheduler = lr_scheduler
+    model = get_model(model_provider_func, model_type)
+    unwrapped_model = unwrap_model(model)
 
-        model, optimizer, _, lr_scheduler = deepspeed.initialize(
-            model=model,
-            optimizer=optimizer,
-            args=neox_args,
-            lr_scheduler=_lr_scheduler,
-            dist_init_required=False,
-            model_parameters=_model_params,
-            # Need to remove the below so that it doesn't conflict with --deepspeed_config required by autotuning
-            # config_params=neox_args.deepspeed_config,
-            mpu=mpu if not neox_args.is_pipe_parallel else None,
-        )
-        model.total_params = get_total_params(model.module)
-        print_rank_0(f' > total params: {"{:,}".format(model.total_params)}')
+    kwargs = {}
+    for f in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = OptimizerConfig(**kwargs)
+    optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
+                                       scale_lr_cond, lr_mult)
+    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
-        if neox_args.is_pipe_parallel:
-            model.set_has_attention_mask(True)
-            if neox_args.curriculum_learning:
-                curr_scheduler = CurriculumScheduler(neox_args.curriculum_learning)
-                if iteration is not None and iteration > 0:
-                    curr_scheduler.update_difficulty(iteration)
-            else:
-                curr_scheduler = None
-            model.set_batch_fn(
-                partial(
-                    get_batch_pipe, neox_args=neox_args, curr_scheduler=curr_scheduler
-                )
-            )
-        else:
-            model.module.set_batch_fn(
-                partial(get_batch_sequential, neox_args=neox_args)
-            )
-
+    if args.load is not None:
+        timers = get_timers()
+        timers('load-checkpoint', log_level=0).start(barrier=True)
+        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+            model, optimizer, opt_param_scheduler)
+        timers('load-checkpoint').stop(barrier=True)
+        timers.log(['load-checkpoint'])
     else:
-        raise ValueError("Must be using deepspeed to run neox")
+        args.iteration = 0
+        args.num_floating_point_operations_so_far = 0
 
-    if neox_args.load is not None:
-        neox_args.iteration = load_checkpoint(
-            neox_args=neox_args,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            iteration=iteration,
-        )
-        print_rank_0(
-            f"Loading checkpoint and starting from iteration {neox_args.iteration}"
-        )
-    else:
-        neox_args.iteration = 0
+    # get model without FP16 and/or DDP wrappers
+    if args.iteration == 0 and len(unwrapped_model) == 1 \
+        and hasattr(unwrapped_model[0], 'init_state_dict_from_bert'):
+        print_rank_0("Initializing ICT from pretrained BERT model")
+        unwrapped_model[0].init_state_dict_from_bert()
+        if args.fp16:
+            optimizer.reload_model_params()
 
-    # need this for correct lr scheduling resume from ckpt
-    # but it will not exist if this is being called for inference
-    if lr_scheduler is not None:
-        lr_scheduler.optimizer = model.optimizer
-
-    return model, optimizer, lr_scheduler
+    return model, optimizer, opt_param_scheduler
 
 
-def backward_step(neox_args, timers, optimizer, model, loss):
-    """Backward step."""
 
-    # Backward pass.
-    timers("backward-backward").start()
-    if neox_args.deepspeed:
-        model.backward(loss)
-    else:
-        raise ValueError("Must be using deepspeed to run neox")
-    timers("backward-backward").stop()
-
-    if neox_args.deepspeed:
-        # DeepSpeed backward propagation already addressed all reduce communication.
-        # Reset the timer to avoid breaking timer logs below.
-        timers("backward-allreduce").reset()
-    else:
-        raise ValueError("Must be using deepspeed to run neox")
-
-
-def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler):
+def train_step(forward_step_func, data_iterator,
+               model, optimizer, opt_param_scheduler, config):
     """Single training step."""
+    args = get_args()
+    timers = get_timers()
 
-    # Pipeline parallelism schedules forward/backward/step
-    if neox_args.is_pipe_parallel:
-        reduced_loss = train_step_pipe(
-            neox_args=neox_args, timers=timers, model=model, data_iterator=data_iterator
-        )
-        if (
-            neox_args.memory_profiling
-            and neox_args.iteration >= neox_args.profile_step_start
-            and neox_args.iteration <= neox_args.profile_step_stop
-            and torch.distributed.get_rank() == 0
-        ):
-            save_snapshot(neox_args)
-    else:
-        losses = []
-        for _ in range(neox_args.gradient_accumulation_steps):
-            # Forward model for one step.
-            timers("forward").start()
-            loss = forward_step(
-                neox_args=neox_args,
-                timers=timers,
-                data_iterator=data_iterator,
-                model=model,
-                is_train=True,
-            )
-            timers("forward").stop()
-            losses.append(loss)
-            # Calculate gradients, reduce across processes, and clip.
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_push(f"Backward pass")
-            timers("backward").start()
-            backward_step(
-                neox_args=neox_args,
-                timers=timers,
-                optimizer=optimizer,
-                model=model,
-                loss=loss,
-            )
-            timers("backward").stop()
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_pop()
-            # Update parameters.
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_push(f"Optimizer step")
-            timers("optimizer").start()
-            if neox_args.deepspeed:
-                model.step()
-            else:
-                raise ValueError("Must be using deepspeed to run neox")
-            timers("optimizer").stop()
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_pop()
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-                and torch.distributed.get_rank() == 0
-            ):
-                save_snapshot(neox_args)
-        reduced_loss = {
-            "lm_loss": reduce_losses(losses).mean()
-        }  # reduces losses across machines for logging
+    # Set grad to zero.
+    for model_chunk in model:
+        # If using distributed optimizer, don't zero buffer here; zeroing of buffer is
+        # handled automatically by the optimizer after all-gathers finish.
+        # Otherwise, zero the buffer.
+        model_chunk.zero_grad_buffer(zero_buffer=(not args.use_distributed_optimizer))
+    optimizer.zero_grad()
 
-    if neox_args.precision == "fp16" and model.optimizer.overflow:
-        skipped_iter = 1
-    else:
+    # Forward pass.
+    forward_backward_func = get_forward_backward_func()
+    losses_reduced = forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=get_num_microbatches(),
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False)
+
+    # Empty unused memory.
+    if args.empty_unused_memory_level >= 1:
+        torch.cuda.empty_cache()
+
+    # Vision gradients.
+    if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
+        unwrapped_model = unwrap_model(model[0])
+        unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+    # Update parameters.
+    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    timers('optimizer').stop()
+
+    # Vision momentum.
+    if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
+        unwrapped_model = unwrap_model(model[0])
+        unwrapped_model.update_momentum(args.curr_iteration)
+
+    # Update learning rate.
+    if update_successful:
+        increment = get_num_microbatches() * \
+                    args.micro_batch_size * \
+                    args.data_parallel_size
+        opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
+    else:
+        skipped_iter = 1
 
-    collect_loss_for_unit_test(reduced_loss["lm_loss"])
-    return reduced_loss, skipped_iter
+    # Empty unused memory.
+    if args.empty_unused_memory_level >= 2:
+        torch.cuda.empty_cache()
 
-
-def train_step_pipe(neox_args, timers, model, data_iterator):
-    """Single training step with DeepSpeed's pipeline parallel engine."""
-
-    assert neox_args.deepspeed
-    loss = model.train_batch(data_iter=data_iterator)
-    loss_dict = {"lm_loss": loss}
-    # Don't break Megatron's timers because we changed code paths.
-    for t in [
-        "forward",
-        "backward",
-        "allreduce",
-        "optimizer",
-        "batch generator",
-        "data loader",
-    ]:
-        timers(t).reset()
-    return loss_dict
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        # Average loss across microbatches.
+        loss_reduced = {}
+        for key in losses_reduced[0]:
+            losses_reduced_for_key = [x[key] for x in losses_reduced]
+            loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+    return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
-def train(
-    neox_args,
-    timers,
-    model,
-    optimizer,
-    lr_scheduler,
-    train_data_iterator,
-    valid_data_iterator,
-):
+def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+                 loss_scale, report_memory_flag, skipped_iter,
+                 grad_norm, params_norm, num_zeros_in_grad):
+    """Log training information such as losses, timing, ...."""
+    args = get_args()
+    timers = get_timers()
+    writer = get_tensorboard_writer()
+    wandb_writer = get_wandb_writer()
+    one_logger = get_one_logger()
+
+    # Advanced, skipped, and Nan iterations.
+    advanced_iters_key = 'advanced iterations'
+    skipped_iters_key = 'skipped iterations'
+    nan_iters_key = 'nan iterations'
+    # Advanced iterations.
+    if not skipped_iter:
+        total_loss_dict[advanced_iters_key] = total_loss_dict.get(
+            advanced_iters_key, 0) + 1
+    else:
+        if advanced_iters_key not in total_loss_dict:
+            total_loss_dict[advanced_iters_key] = 0
+    # Skipped iterations.
+    total_loss_dict[skipped_iters_key] = total_loss_dict.get(
+        skipped_iters_key, 0) + skipped_iter
+    # Update losses and set nan iterations
+    got_nan = False
+    for key in loss_dict:
+        if not skipped_iter:
+            total_loss_dict[key] = total_loss_dict.get(
+                key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
+        else:
+            value = loss_dict[key].float().sum().item()
+            is_nan = value == float('inf') or \
+                     value == -float('inf') or \
+                     value != value
+            got_nan = got_nan or is_nan
+    total_loss_dict[nan_iters_key] = total_loss_dict.get(
+        nan_iters_key, 0) + int(got_nan)
+
+    # Logging.
+    timers_to_log = [
+        'forward-backward',
+        'forward-compute',
+        'backward-compute',
+        'batch-generator',
+        'forward-recv',
+        'forward-send',
+        'backward-recv',
+        'backward-send',
+        'forward-send-forward-recv',
+        'forward-send-backward-recv',
+        'backward-send-forward-recv',
+        'backward-send-backward-recv',
+        'forward-backward-send-forward-backward-recv',
+        'layernorm-grads-all-reduce',
+        'embedding-grads-all-reduce',
+        'all-grads-sync',
+        'params-all-gather',
+        'optimizer-copy-to-main-grad',
+        'optimizer-unscale-and-check-inf',
+        'optimizer-clip-main-grad',
+        'optimizer-count-zeros',
+        'optimizer-inner-step',
+        'optimizer-copy-main-to-model-params',
+        'optimizer']
+
+    # Calculate batch size.
+    batch_size = args.micro_batch_size * args.data_parallel_size * \
+        get_num_microbatches()
+
+    # Track app tag & app tag ID
+    if one_logger:
+        job_name = os.environ.get('SLURM_JOB_NAME', None)
+        current_app_tag = f'{job_name}_{batch_size}_{args.world_size}'
+        one_logger.log_app_tag(current_app_tag)
+
+    total_iterations = total_loss_dict[advanced_iters_key] + \
+                       total_loss_dict[skipped_iters_key]
+
+    # Tensorboard values.
+    # Timer requires all the ranks to call.
+    if args.log_timers_to_tensorboard and \
+       (iteration % args.tensorboard_log_interval == 0):
+        timers.write(timers_to_log, writer, iteration,
+                     normalizer=total_iterations)
+    if writer and (iteration % args.tensorboard_log_interval == 0):
+        if wandb_writer:
+            wandb_writer.log({'samples vs steps': args.consumed_train_samples},
+                             iteration)
+        if args.log_learning_rate_to_tensorboard:
+            writer.add_scalar('learning-rate', learning_rate, iteration)
+            writer.add_scalar('learning-rate vs samples', learning_rate,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        if args.log_batch_size_to_tensorboard:
+            writer.add_scalar('batch-size', batch_size, iteration)
+            writer.add_scalar('batch-size vs samples', batch_size,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'batch-size': batch_size}, iteration)
+        for key in loss_dict:
+            writer.add_scalar(key , loss_dict[key], iteration)
+            writer.add_scalar(key + ' vs samples', loss_dict[key],
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({key: loss_dict[key]}, iteration)
+        if args.log_loss_scale_to_tensorboard:
+            writer.add_scalar('loss-scale', loss_scale, iteration)
+            writer.add_scalar('loss-scale vs samples', loss_scale,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'loss-scale': loss_scale}, iteration)
+        if args.log_world_size_to_tensorboard:
+            writer.add_scalar('world-size', args.world_size, iteration)
+            writer.add_scalar('world-size vs samples', args.world_size,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'world-size': args.world_size}, iteration)
+        if grad_norm is not None:
+            writer.add_scalar('grad-norm', grad_norm, iteration)
+            writer.add_scalar('grad-norm vs samples', grad_norm,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'grad-norm': grad_norm}, iteration)
+        if num_zeros_in_grad is not None:
+            writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
+            writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
+        if params_norm is not None:
+            writer.add_scalar('params-norm', params_norm, iteration)
+            writer.add_scalar('params-norm vs samples', params_norm,
+                              args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'params-norm': params_norm}, iteration)
+        if args.log_memory_to_tensorboard:
+            mem_stats = torch.cuda.memory_stats()
+            writer.add_scalar(
+                "mem-reserved-bytes",
+                mem_stats["reserved_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-bytes",
+                mem_stats["allocated_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-count",
+                mem_stats["allocation.all.current"],
+                iteration,
+            )
+
+    if iteration % args.log_interval == 0:
+        elapsed_time = timers('interval-time').elapsed(barrier=True)
+        elapsed_time_per_iteration = elapsed_time / total_iterations
+
+        throughput = num_floating_point_operations(args, batch_size) / (
+            elapsed_time_per_iteration * 10**12 * args.world_size)
+        if args.log_timers_to_tensorboard:
+            if writer:
+                writer.add_scalar('iteration-time',
+                                  elapsed_time_per_iteration, iteration)
+            if wandb_writer:
+                wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
+                                 iteration)
+        log_string = ' iteration {:8d}/{:8d} |'.format(
+            iteration, args.train_iters)
+        log_string += ' consumed samples: {:12d} |'.format(
+            args.consumed_train_samples)
+        log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
+            elapsed_time_per_iteration * 1000.0)
+        if args.log_throughput:
+            log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            if args.log_timers_to_tensorboard:
+                if writer:
+                    writer.add_scalar('throughput', throughput, iteration)
+                if wandb_writer:
+                    wandb_writer.log({'throughput': throughput}, iteration)
+        log_string += ' learning rate: {:.3E} |'.format(learning_rate)
+        log_string += ' global batch size: {:5d} |'.format(batch_size)
+        for key in total_loss_dict:
+            if key not in [advanced_iters_key, skipped_iters_key,
+                           nan_iters_key]:
+                avg = total_loss_dict[key].item() / \
+                      float(max(1, total_loss_dict[advanced_iters_key]))
+                if avg > 0.0:
+                    log_string += ' {}: {:.6E} |'.format(key, avg)
+                total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        log_string += ' loss scale: {:.1f} |'.format(loss_scale)
+        if grad_norm is not None:
+            log_string += ' grad norm: {:.3f} |'.format(grad_norm)
+        if num_zeros_in_grad is not None:
+            log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
+        if params_norm is not None:
+            log_string += ' params norm: {:.3f} |'.format(params_norm)
+        log_string += ' number of skipped iterations: {:3d} |'.format(
+            total_loss_dict[skipped_iters_key])
+        log_string += ' number of nan iterations: {:3d} |'.format(
+            total_loss_dict[nan_iters_key])
+        total_loss_dict[advanced_iters_key] = 0
+        total_loss_dict[skipped_iters_key] = 0
+        total_loss_dict[nan_iters_key] = 0
+        print_rank_last(log_string)
+        if report_memory_flag and learning_rate > 0.:
+            # Report memory after optimizer state has been initialized.
+            if torch.distributed.get_rank() == 0:
+                num_microbatches = get_num_microbatches()
+                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+            report_memory('(after {} iterations)'.format(iteration))
+            report_memory_flag = False
+        timers.log(timers_to_log, normalizer=args.log_interval)
+
+    return report_memory_flag
+
+
+def compute_throughputs_and_append_to_progress_log(iteration,
+                                                   num_floating_point_operations_so_far):
+    args = get_args()
+    if args.save is None:
+        return
+
+    # Compute job throughput.
+    # args.num_floating_point_operations_so_far keeps track of floating-point operations
+    # completed at the start of job.
+    global _TRAIN_START_TIME
+    job_throughput = \
+        (num_floating_point_operations_so_far -
+         args.num_floating_point_operations_so_far) / (
+            (time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+
+    # Compute cumulative throughput since jobs of this world size were launched.
+    # `get_start_time_from_progress_log` returns start time and number of floating-point
+    # operations of first job of this world size.
+    start_time, start_num_floating_point_operations = get_start_time_from_progress_log()
+    elapsed_time = (datetime.now() - start_time).total_seconds()
+    cumulative_throughput = \
+        (num_floating_point_operations_so_far -
+         start_num_floating_point_operations) / (
+            elapsed_time * 10**12 * args.world_size)
+
+    tokens_so_far = args.consumed_train_samples * args.seq_length
+
+    append_to_progress_log(f"Saved checkpoint\tIteration: {iteration}\t"
+                           f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
+                           f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
+                           f"Floating-point operations: {num_floating_point_operations_so_far:.2e}\t"
+                           f"Tokens (in billions): {tokens_so_far / 10**9:.2f}")
+
+
+def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
+                             num_floating_point_operations_so_far):
+    args = get_args()
+    timers = get_timers()
+    # Extra barrier is added to make sure all ranks report the max time.
+    timers('save-checkpoint', log_level=0).start(barrier=True)
+    save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
+                    num_floating_point_operations_so_far)
+    timers('save-checkpoint').stop(barrier=True)
+    timers.log(['save-checkpoint'])
+
+    if args.log_progress:
+        compute_throughputs_and_append_to_progress_log(iteration,
+                                                       num_floating_point_operations_so_far)
+
+
+def train(forward_step_func, model, optimizer, opt_param_scheduler,
+          train_data_iterator, valid_data_iterator,
+          process_non_loss_data_func, config):
     """Train the model function."""
+    args = get_args()
+    timers = get_timers()
+
+    # Write args to tensorboard
+    write_args_to_tensorboard()
 
     # Turn on training mode which enables dropout.
-    model.train()
+    for model_module in model:
+        model_module.train()
 
     # Tracking loss.
     total_loss_dict = {}
 
     # Iterations.
-    iteration = neox_args.iteration
+    iteration = args.iteration
+    one_logger = get_one_logger()
+    if one_logger:
+        iteration_start = iteration
+        train_samples_start = args.consumed_train_samples
+        train_samples_target = args.train_samples
+        one_logger.log_metrics({
+            'train_samples_start': args.consumed_train_samples,
+            'train_iterations_start': iteration,
+            'train_samples_target': train_samples_target,
+            'train_iterations_target': args.train_iters,
+        })
 
-    timers("interval time").start()
+    num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
+
+    # Setup some training config params
+    config.grad_scale_func = optimizer.scale_loss
+    config.timers = timers
+    if isinstance(model[0], DDP) and args.overlap_grad_reduce:
+        assert config.no_sync_func is None, \
+            ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
+             'a custom no_sync_func is not supported when overlapping grad-reduce')
+        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        if len(model) == 1:
+            config.no_sync_func = config.no_sync_func[0]
+        if args.delay_grad_reduce:
+            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+            if len(model) == 1:
+                config.grad_sync_func = config.grad_sync_func[0]
+    if args.overlap_param_gather and args.delay_param_gather:
+        config.param_sync_func = [lambda x: optimizer.finish_param_sync(model_index, x)
+                                  for model_index in range(len(model))]
+        if len(model) == 1:
+            config.param_sync_func = config.param_sync_func[0]
+    config.finalize_model_grads_func = finalize_model_grads
+
+    timers('interval-time', log_level=0).start(barrier=True)
+    print_datetime('before the start of training step')
     report_memory_flag = True
+    exit = False
 
-    # get noise scale logger (if neox_args.log_gradient_noise_scale is True)
-    noise_scale_logger = get_noise_scale_logger(neox_args)
+    if args.manual_gc:
+        # Disable the default garbage collector and perform the collection manually.
+        # This is to align the timing of garbage collection across ranks.
+        assert args.manual_gc_interval >= 0, \
+            'Manual garbage collection interval should be laerger than or equal to 0.'
+        gc.disable()
+        gc.collect()
 
-    # to monitor if we've skipped many iterations in a row and trigger an early exit
-    overflow_monitor = OverflowMonitor(optimizer)
-    while iteration < neox_args.train_iters:
-        if neox_args.profile and iteration == neox_args.profile_step_start:
+    num_microbatches = get_num_microbatches()
+    eval_duration = 0.0
+    eval_iterations = 0
+    def track_e2e_metrics():
+        # Nested function to track a bunch of E2E APP metrics
+        if one_logger:
+            train_duration = timers('interval-time').active_time()  # overall_elapsed
+            train_samples = args.consumed_train_samples - train_samples_start
+            train_iterations = iteration - iteration_start
+            train_iterations_time_msecs_avg = (train_duration * 1000.0) / train_iterations
+            if eval_iterations:
+                validation_iterations_time_msecs_avg = (eval_duration * 1000.0) / eval_iterations
+            else:
+                validation_iterations_time_msecs_avg = None
+
+            one_logger.log_metrics({
+                'train_iterations_end': iteration,
+                'train_samples_end': args.consumed_train_samples,
+                'train_iterations': train_iterations,
+                'train_samples': train_samples,
+                'train_iterations_time_msecs_avg': train_iterations_time_msecs_avg,
+                'validation_iterations_time_msecs_avg': validation_iterations_time_msecs_avg
+            })
+
+    while iteration < args.train_iters:
+        if args.profile and \
+           iteration == args.profile_step_start and \
+           torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
-        loss_dict, skipped_iter = train_step(
-            neox_args=neox_args,
-            timers=timers,
-            data_iterator=train_data_iterator,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-        )
-        if neox_args.profile and iteration == neox_args.profile_step_stop:
-            torch.cuda.cudart().cudaProfilerStop()
-        iteration += 1
-        neox_args.iteration = iteration
-        if neox_args.precision == "fp16":
-            overflow_monitor.check(skipped_iter)  # check for repeated overflow
-        if neox_args.log_gradient_noise_scale:  # log noise scale if applicable
-            noise_scale_logger.update()
+            torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
-        # get learning rate (if present) - if doing soft prompt tuning + pipe parallel, you
-        # may have no tunable parameters on a specific rank
-        if optimizer.param_groups:
-            lr = optimizer.param_groups[0].get("lr", 0)
-        else:
-            lr = 0
+        # Update number of microbatches first without consistency check to decide if a
+        # checkpoint should be saved. If the number of microbatches is different
+        # from the previous iteration, save a checkpoint. Then run consistency check
+        # to make sure training configuration is still valid.
+        update_num_microbatches(args.consumed_train_samples, consistency_check=False)
+        if get_num_microbatches() != num_microbatches and iteration != 0:
+            assert get_num_microbatches() > num_microbatches, \
+                "number of microbatches should be increasing due to batch size rampup"
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     opt_param_scheduler,
+                                     num_floating_point_operations_so_far)
+        num_microbatches = get_num_microbatches()
+        update_num_microbatches(args.consumed_train_samples, consistency_check=True)
+
+        args.curr_iteration = iteration
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+            train_step(forward_step_func,
+                       train_data_iterator,
+                       model,
+                       optimizer,
+                       opt_param_scheduler,
+                       config)
+        iteration += 1
+        batch_size = mpu.get_data_parallel_world_size() * \
+                     args.micro_batch_size * \
+                     get_num_microbatches()
+        args.consumed_train_samples += batch_size
+        num_floating_point_operations_so_far += num_floating_point_operations(args, batch_size)
 
         # Logging.
-        report_memory_flag = training_log(
-            neox_args=neox_args,
-            timers=timers,
-            loss_dict=loss_dict,
-            total_loss_dict=total_loss_dict,
-            learning_rate=lr,
-            iteration=iteration,
-            loss_scale=optimizer.cur_scale if neox_args.precision == "fp16" else None,
-            report_memory_flag=report_memory_flag,
-            skipped_iter=skipped_iter,
-            model=model,
-            optimizer=optimizer,
-            noise_scale_logger=noise_scale_logger,
-        )
+        loss_scale = optimizer.get_loss_scale().item()
+        params_norm = None
+        if args.log_params_norm:
+            params_norm = calc_params_l2_norm(model)
+
+        if iteration % args.log_interval == 0:
+            track_e2e_metrics()
+
+        report_memory_flag = training_log(loss_dict, total_loss_dict,
+                                          optimizer.param_groups[0]['lr'],
+                                          iteration, loss_scale,
+                                          report_memory_flag, skipped_iter,
+                                          grad_norm, params_norm, num_zeros_in_grad)
+
+        # Autoresume
+        if args.adlr_autoresume and \
+           (iteration % args.adlr_autoresume_interval == 0):
+            check_adlr_autoresume_termination(iteration, model, optimizer,
+                                              opt_param_scheduler)
+
+        # Evaluation
+        if args.eval_interval and iteration % args.eval_interval == 0 and \
+           args.do_valid:
+            timers('interval-time').stop()
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.disable_pre_hook()
+            if args.manual_gc and args.manual_gc_eval:
+                # Collect all objects.
+                gc.collect()
+            prefix = 'iteration {}'.format(iteration)
+            timers('eval-time', log_level=0).start(barrier=True)
+            evaluate_and_print_results(prefix, forward_step_func,
+                                       valid_data_iterator, model,
+                                       iteration, process_non_loss_data_func,
+                                       config, False)
+            eval_duration += timers('eval-time').elapsed()
+            eval_iterations += args.eval_iters
+            timers('eval-time').stop()
+            if args.manual_gc and args.manual_gc_eval:
+                # Collect only the objects created and used in evaluation.
+                gc.collect(generation=0)
+            if args.use_distributed_optimizer and args.overlap_param_gather:
+                optimizer.enable_pre_hook()
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Checkpointing
-        if neox_args.save and iteration in neox_args.save_iters:
-            save_checkpoint(
-                neox_args=neox_args,
-                iteration=iteration,
-                model=model,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-            )
-        # Evaluation
-        if (
-            neox_args.eval_interval
-            and iteration % neox_args.eval_interval == 0
-            and neox_args.do_valid
-        ):
-            prefix = "iteration {}".format(iteration)
-            evaluate_and_print_results(
-                neox_args=neox_args,
-                prefix=prefix,
-                forward_step_func=forward_step,
-                data_iterator=valid_data_iterator,
-                model=model,
-                iteration=iteration,
-                verbose=False,
-                timers=timers,
-            )
+        saved_checkpoint = False
+        if args.exit_signal_handler:
+            signal_handler = get_signal_handler()
+            if any(signal_handler.signals_received()):
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler,
+                                         num_floating_point_operations_so_far)
+                print_datetime('exiting program after receiving SIGTERM.')
+                exit = True
+                break
 
-        if neox_args.exit_interval and iteration % neox_args.exit_interval == 0:
+        if args.save and args.save_interval and \
+           iteration % args.save_interval == 0:
+            timers('interval-time').stop()
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     opt_param_scheduler,
+                                     num_floating_point_operations_so_far)
+            saved_checkpoint = True
+            timers('interval-time', log_level=0).start(barrier=True)
+
+        # Exiting based on duration
+        if args.exit_duration_in_mins:
+            train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+            done_cuda = torch.tensor(
+                [train_time > args.exit_duration_in_mins],
+                dtype=torch.int, device='cuda')
+            torch.distributed.all_reduce(
+                done_cuda, op=torch.distributed.ReduceOp.MAX)
+            done = done_cuda.item()
+            if done:
+                if not saved_checkpoint:
+                    save_checkpoint_and_time(iteration, model, optimizer,
+                                             opt_param_scheduler,
+                                             num_floating_point_operations_so_far)
+                print_datetime('exiting program after {} minutes'.format(train_time))
+                exit = True
+                break
+
+        # Exiting based on iterations
+        if args.exit_interval and iteration % args.exit_interval == 0:
+            if args.save and not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         opt_param_scheduler,
+                                         num_floating_point_operations_so_far)
             torch.distributed.barrier()
-            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rank = torch.distributed.get_rank()
-            print_rank_0(
-                "rank: {} | time: {} | exiting the program at iteration {}".format(
-                    rank, time_str, iteration
-                )
-            )
-            sys.exit()
+            print_datetime('exiting program at iteration {}'.format(iteration))
+            exit = True
+            break
 
-    return iteration
+        if args.profile and \
+           iteration == args.profile_step_end and \
+           torch.distributed.get_rank() in args.profile_ranks:
+            torch.cuda.cudart().cudaProfilerStop()
+
+        if args.manual_gc:
+            if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
+                gc.collect()
+
+    track_e2e_metrics()
+
+    # Flush TensorBoard and WandB writers.
+    writer = get_tensorboard_writer()
+    if writer:
+        writer.flush()
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.finish()
+
+    # Close out pre-hooks if using distributed optimizer and overlapped param gather.
+    if args.use_distributed_optimizer and args.overlap_param_gather:
+        optimizer.disable_pre_hook()
+
+    # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
+    if exit:
+        sys.exit()
+
+    return iteration, num_floating_point_operations_so_far
 
 
-def evaluate(
-    neox_args, forward_step_fn, data_iterator, model, verbose=False, timers=None
-):
-    """Evaluation.
-    neox_args: NeoX Arguments
-    forward_step_fn: function with args `neox_args, timers,
-                    data_iterator & model that will run a forward pass on the model
-    data_iterator: Iterator that iterates over batches of data. Should return data in the form:
-                    {'text': np.array([tokens], dtype=np.int64)}
-                    where the size of the array is the model's context size + 1
-                    (`get_batch` transforms it into inputs / labels)
-    """
+def evaluate(forward_step_func,
+             data_iterator,
+             model,
+             process_non_loss_data_func,
+             config,
+             verbose=False):
+    """Evaluation."""
+    args = get_args()
+    timers = get_timers()
+
+    timers('evaluate', log_level=0).start(barrier=True)
+
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        compute_feature_bank(model)
+
     # Turn on evaluation mode which disables dropout.
-    model.eval()
-    losses = []
-    if neox_args.char_level_ppl:
-        data_iterator = CharCounter(data_iterator, neox_args.tokenizer)
+    for model_module in model:
+        model_module.eval()
+
+    total_loss_dict = {}
+
+    # make validation batch size independent from training batch size
+    eval_batch_size = args.global_batch_size
+    eval_num_microbatches = eval_batch_size // \
+        (args.micro_batch_size * args.data_parallel_size)
 
     with torch.no_grad():
         iteration = 0
-        while iteration < neox_args.eval_iters:
+        if verbose:
+            print_rank_0(f'Evaluating on {args.eval_iters * eval_batch_size} samples')
+        while iteration < args.eval_iters:
             iteration += 1
-            if verbose and iteration % neox_args.log_interval == 0:
-                print_rank_0(
-                    "Evaluating iter {}/{}".format(iteration, neox_args.eval_iters)
-                )
+            if verbose:
+                print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
 
-            # although we're not accumulating gradients here, we count one iter as train_batch_size_per_gpu * g.a.s
-            # to be consistent with deepspeed's pipe parallel engine
-            # since pipe parallel already takes gradient_accumulation_steps into account - default to 1 here if pipe parallel is true
-            for _ in range(
-                1
-                if neox_args.is_pipe_parallel
-                else neox_args.gradient_accumulation_steps
-            ):
-                # Forward evaluation
-                loss = forward_step_fn(
-                    model=model,
-                    data_iterator=data_iterator,
-                    neox_args=neox_args,
-                    timers=timers,
-                )
-                losses.append(loss)
+            forward_backward_func = get_forward_backward_func()
+            # Don't care about timing during evaluation
+            config.timers = None
+            loss_dicts = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=eval_num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=True)
+            config.timers = get_timers()
 
-            # When contiguous memory optimizations are enabled, the buffers
-            # allocated by the optimizations are deallocated during backward pass
-            # in the absence of backward pass the buffers should be reset after each
-            # forward pass
-            if neox_args.deepspeed and neox_args.deepspeed_activation_checkpointing:
-                deepspeed.checkpointing.reset()
+            # Empty unused memory
+            if args.empty_unused_memory_level >= 1:
+                torch.cuda.empty_cache()
 
-    # reduces losses across processes for logging & run eval harness tasks
-    eval_results = {"lm_loss": reduce_losses(losses).mean().item()}
-    eval_results["lm_loss_ppl"] = math.exp(eval_results["lm_loss"])
+            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                # Reduce across processes.
+                for loss_dict in loss_dicts:
+                    for key in loss_dict:
+                        total_loss_dict[key] = total_loss_dict.get(
+                            key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
 
-    if neox_args.char_level_ppl:
-        # calculate character level perplexity, if specified
-        # if neox_args.char_level_ppl:
-        # unwrap the data_iterator
-        tokens_per_char = data_iterator.tokens_per_char()
-        print_rank_0(f"Counting chars took {data_iterator.total_time} seconds")
+            args.consumed_valid_samples += eval_batch_size
 
-        data_iterator = data_iterator.data_iterator
-        eval_results["lm_loss_char_lvl_ppl"] = math.exp(
-            eval_results["lm_loss"] * tokens_per_char
-        )
+            if args.exit_duration_in_mins:
+                train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+                done_cuda = torch.tensor(
+                    [train_time > args.exit_duration_in_mins],
+                    dtype=torch.int, device='cuda')
+                torch.distributed.all_reduce(
+                    done_cuda, op=torch.distributed.ReduceOp.MAX)
+                done = done_cuda.item()
+                if done:
+                    print_rank_0('Exiting during evaluation, timelimit reached')
+                    return None, None, True
 
-    if neox_args.eval_tasks:
-        from eval_tasks import run_eval_harness
+        collected_non_loss_data = None
+        if process_non_loss_data_func is not None and is_last_rank():
+            collected_non_loss_data = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=True,
+                collect_non_loss_data=True)
 
-        eval_results.update(
-            run_eval_harness(
-                model, forward_step_fn, neox_args, eval_tasks=neox_args.eval_tasks
-            ).get("results")
-        )
     # Move model back to the train mode.
-    model.train()
-    return eval_results
+    for model_module in model:
+        model_module.train()
 
+    for key in total_loss_dict:
+        total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
 
-def collect_loss_for_unit_test(lm_ss):
-    # Logic moved to separate function to allow tracking in unit tests with unittest.mock.patch
-    pass
+    timers('evaluate').stop()
+    timers.log(['evaluate'])
 
+    return total_loss_dict, collected_non_loss_data, False
 
-def evaluate_and_print_results(
-    neox_args,
-    prefix,
-    forward_step_func,
-    data_iterator,
-    model,
-    iteration,
-    verbose=False,
-    timers=None,
-    chart_name="validation",
-):
+def evaluate_and_print_results(prefix, forward_step_func,
+                               data_iterator, model,
+                               iteration, process_non_loss_data_func, config,
+                               verbose=False, write_to_tensorboard=True):
     """Helper function to evaluate and dump results on screen."""
-    total_loss_dict = evaluate(
-        neox_args=neox_args,
-        forward_step_fn=forward_step_func,
-        data_iterator=data_iterator,
-        model=model,
-        verbose=verbose,
-        timers=timers,
-    )
-    string = f" {chart_name} results at {prefix} | "
-    for k, v in total_loss_dict.items():
-        if isinstance(v, dict):
-            if neox_args.eval_tasks and "results" in v:
-                v = v["results"]
-                print(v)
-            for k2, v2 in v.items():
-                k3 = "_".join([k, k2])
-                string += f"{k3} value: {v2:.6E} | "
-                tb_wandb_log(
-                    f"{chart_name}/{k3}",
-                    v2,
-                    iteration,
-                    use_wandb=neox_args.use_wandb,
-                    tensorboard_writer=neox_args.tensorboard_writer,
-                )
-        else:
-            string += f"{k} value: {v:.6E} | "
-            tb_wandb_log(
-                f"{chart_name}/{k}",
-                v,
-                iteration,
-                use_wandb=neox_args.use_wandb,
-                tensorboard_writer=neox_args.tensorboard_writer,
-            )
+    args = get_args()
+    if write_to_tensorboard:
+        writer = get_tensorboard_writer()
+    else:
+        writer = None
+
+    wandb_writer = get_wandb_writer()
+
+    total_loss_dict, collected_non_loss_data, timelimit = evaluate(
+        forward_step_func, data_iterator, model,
+        process_non_loss_data_func, config, verbose)
+    # Timelimit hit during evaluation
+    if timelimit:
+        return
+    string = ' validation loss at {} | '.format(prefix)
+    for key in total_loss_dict:
+        string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
+        ppl = math.exp(min(20, total_loss_dict[key].item()))
+        string += '{} PPL: {:.6E} | '.format(key, ppl)
+        if writer:
+            writer.add_scalar('{} validation'.format(key),
+                              total_loss_dict[key].item(),
+                              iteration)
+            writer.add_scalar('{} validation vs samples'.format(key),
+                              total_loss_dict[key].item(),
+                              args.consumed_train_samples)
+            if args.log_validation_ppl_to_tensorboard:
+                writer.add_scalar('{} validation ppl'.format(key), ppl,
+                                  iteration)
+                writer.add_scalar('{} validation ppl vs samples'.format(key),
+                                  ppl, args.consumed_train_samples)
+            if wandb_writer and is_last_rank():
+                wandb_writer.log({
+                    '{} validation'.format(key): total_loss_dict[key].item()},
+                    iteration)
+
+    if process_non_loss_data_func is not None and writer and is_last_rank():
+        process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1
-    print_rank_0("-" * length)
-    print_rank_0(string)
-    print_rank_0("-" * length)
+    print_rank_last('-' * length)
+    print_rank_last(string)
+    print_rank_last('-' * length)
 
 
-def save_snapshot(neox_args):
-    assert (
-        neox_args.memory_profiling_path is not None
-    ), "Must pass memory_profiling_path config arg to use profiling"
-    snapshot = torch.cuda.memory._snapshot()
-    snapshot_path = os.path.join(neox_args.memory_profiling_path)
-    if not os.path.exists(snapshot_path):
-        os.makedirs(snapshot_path)
-    with open(os.path.join(snapshot_path, "mem_snapshot.pickle"), "wb") as f:
-        dump(snapshot, f)
+def cyclic_iter(iter):
+    while True:
+        for x in iter:
+            yield x
+
+
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
+    """Build pretraining datasets."""
+
+    args = get_args()
+
+    # Number of train/valid/test samples.
+    if args.train_samples:
+        train_samples = args.train_samples
+    else:
+        train_samples = args.train_iters * args.global_batch_size
+    eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                 args.eval_iters
+    test_iters = args.eval_iters
+    train_val_test_num_samples = [train_samples,
+                                  eval_iters * args.global_batch_size,
+                                  test_iters * args.global_batch_size]
+    print_rank_0(' > datasets target sizes (minimum size):')
+    print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+    print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+    print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+
+    # Build the datasets.
+    return build_train_valid_test_datasets_provider(train_val_test_num_samples)
+
+
+def build_train_valid_test_data_loaders(
+        build_train_valid_test_datasets_provider):
+    """Build pretraining data loaders."""
+
+    args = get_args()
+
+    (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
+
+    print_rank_0('> building train, validation, and test datasets ...')
+
+    # Backward compatibility, assume fixed batch size.
+    if args.iteration > 0 and args.consumed_train_samples == 0:
+        assert args.train_samples is None, \
+            'only backward compatiblity support for iteration-based training'
+        args.consumed_train_samples = args.iteration * args.global_batch_size
+    if args.iteration > 0 and args.consumed_valid_samples == 0:
+        if args.train_samples is None:
+            args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
+                args.eval_iters * args.global_batch_size
+
+    # Rely on distributed-aware core datasets, temporary
+    is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
+
+    # Construct the data pipeline
+    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
+
+        # Build datasets.
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            build_train_valid_test_datasets_provider)
+        # Build dataloders.
+        train_dataloader = build_pretraining_data_loader(
+            train_ds, args.consumed_train_samples)
+        if args.skip_train:
+            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
+        else:
+            valid_dataloader = build_pretraining_data_loader(
+                valid_ds, args.consumed_valid_samples)
+        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+
+        # Flags to know if we need to do training/validation/testing.
+        do_train = train_dataloader is not None and args.train_iters > 0
+        do_valid = valid_dataloader is not None and args.eval_iters > 0
+        do_test = test_dataloader is not None and args.eval_iters > 0
+        flags = torch.tensor(
+            [int(do_train), int(do_valid), int(do_test)],
+            dtype=torch.long, device='cuda')
+    else:
+        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+
+    torch.distributed.broadcast(flags, 0)
+
+    args.do_train = getattr(args, "do_train", False) or flags[0].item()
+    args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
+    args.do_test = getattr(args, "do_test", False) or flags[2].item()
+
+    return train_dataloader, valid_dataloader, test_dataloader
+
+
+def build_train_valid_test_data_iterators(
+        build_train_valid_test_datasets_provider):
+    """Build pretraining data iterators."""
+
+    args = get_args()
+
+    # Build loaders.
+    train_dataloader, valid_dataloader, test_dataloader = \
+        build_train_valid_test_data_loaders(
+            build_train_valid_test_datasets_provider)
+
+    # Build iterators.
+    dl_type = args.dataloader_type
+    assert dl_type in ['single', 'cyclic']
+
+    if train_dataloader is not None:
+        train_data_iterator = iter(train_dataloader) if dl_type == 'single' \
+                              else iter(cyclic_iter(train_dataloader))
+    else:
+        train_data_iterator = None
+
+    if valid_dataloader is not None:
+        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
+                              else iter(cyclic_iter(valid_dataloader))
+    else:
+        valid_data_iterator = None
+
+    if test_dataloader is not None:
+        test_data_iterator = iter(test_dataloader) if dl_type == 'single' \
+                             else iter(cyclic_iter(test_dataloader))
+    else:
+        test_data_iterator = None
+
+    return train_data_iterator, valid_data_iterator, test_data_iterator
