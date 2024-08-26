@@ -163,6 +163,45 @@ class NeoXArgs(*BASE_CLASSES):
                     flush=True,
                 )
 
+    def initialize_comet(self):
+        if self.use_comet and self.rank == 0:
+            try:
+                import comet_ml
+
+                # Deactivate output logging to avoid any potential interference with Tee
+                self.comet_experiment = comet_ml.start(
+                    workspace=self.comet_workspace,
+                    project=self.comet_project,
+                    experiment_config=comet_ml.ExperimentConfig(
+                        auto_output_logging=False
+                    ),
+                )
+                # Might be too soon?
+                self.comet_experiment.__internal_api__log_parameters__(
+                    self.all_config,
+                    framework="gpt-neox",
+                    source="manual",
+                    flatten_nested=True,
+                )
+
+                if self.comet_experiment_name:
+                    self.comet_experiment.set_name(self.comet_experiment_name)
+
+                if self.comet_tags:
+                    self.comet_experiment.add_tags(self.comet_tags)
+
+                if self.comet_others:
+                    self.comet_experiment.log_others(self.comet_others)
+
+                logging.info("> setting comet ...")
+            except Exception:
+                logging.error(
+                    "Error setting up Comet, logging to Comet is disabled",
+                    exc_info=True,
+                )
+                self.use_comet = False
+                self.comet_experiment = None
+
     @classmethod
     def from_ymls(cls, paths_to_yml_files: List[str], overwrite_values: Dict = None):
         """
