@@ -54,7 +54,7 @@ from megatron.utils import Timers
 
 def pretrain(neox_args):
     """Main training program.
-    
+
     This function will run the followings in the order provided:
         1) initialize Megatron.
         2) setup model, optimizer and lr schedule
@@ -146,11 +146,11 @@ def pretrain(neox_args):
 def _get_batch(neox_args, tokenizer, keys, data, datatype):
     """Support function for get_batch / get_batch pipe (to avoid code repetition)
 
-    :param neox_args: 
-    :param tokenizer: 
-    :param keys: 
-    :param data: 
-    :param datatype: 
+    :param neox_args:
+    :param tokenizer:
+    :param keys:
+    :param data:
+    :param datatype:
 
     """
     data_b = mpu.broadcast_data(keys, data, datatype)
@@ -171,8 +171,8 @@ def _get_batch(neox_args, tokenizer, keys, data, datatype):
 def get_batch(neox_args, data_iterator):
     """Generate a batch
 
-    :param neox_args: 
-    :param data_iterator: 
+    :param neox_args:
+    :param data_iterator:
 
     """
 
@@ -197,8 +197,8 @@ def get_batch(neox_args, data_iterator):
 def get_batch_pipe(data, neox_args):
     """A modification of get_batch() to work with the latest batch instead of an iterator.
 
-    :param data: 
-    :param neox_args: 
+    :param data:
+    :param neox_args:
 
     """
     # Items and their type.
@@ -215,10 +215,10 @@ def get_batch_pipe(data, neox_args):
 def forward_step(data_iterator, model, neox_args, timers, return_logits=False):
     """Forward step.
 
-    :param data_iterator: 
-    :param model: 
-    :param neox_args: 
-    :param timers: 
+    :param data_iterator:
+    :param model:
+    :param neox_args:
+    :param timers:
     :param return_logits:  (Default value = False)
 
     """
@@ -246,7 +246,7 @@ def forward_step(data_iterator, model, neox_args, timers, return_logits=False):
 def get_model(neox_args, inference=False, get_key_value=True):
     """Build the model.
 
-    :param neox_args: 
+    :param neox_args:
     :param inference:  (Default value = False)
     :param get_key_value:  (Default value = True)
 
@@ -301,8 +301,8 @@ def get_model(neox_args, inference=False, get_key_value=True):
 def get_optimizer(model, neox_args):
     """Set up the optimizer.
 
-    :param model: 
-    :param neox_args: 
+    :param model:
+    :param neox_args:
 
     """
     if neox_args.no_load_optim:
@@ -396,8 +396,8 @@ def get_optimizer(model, neox_args):
 def get_learning_rate_scheduler(optimizer, neox_args):
     """Build the learning rate scheduler.
 
-    :param optimizer: 
-    :param neox_args: 
+    :param optimizer:
+    :param neox_args:
 
     """
     if neox_args.no_load_optim:
@@ -436,7 +436,7 @@ def get_learning_rate_scheduler(optimizer, neox_args):
 def setup_model_and_optimizer(neox_args, inference=False, get_key_value=True):
     """Setup model and optimizer.
 
-    :param neox_args: 
+    :param neox_args:
     :param inference:  (Default value = False)
     :param get_key_value:  (Default value = True)
 
@@ -496,11 +496,11 @@ def setup_model_and_optimizer(neox_args, inference=False, get_key_value=True):
 def backward_step(neox_args, timers, optimizer, model, loss):
     """Backward step.
 
-    :param neox_args: 
-    :param timers: 
-    :param optimizer: 
-    :param model: 
-    :param loss: 
+    :param neox_args:
+    :param timers:
+    :param optimizer:
+    :param model:
+    :param loss:
 
     """
 
@@ -523,12 +523,12 @@ def backward_step(neox_args, timers, optimizer, model, loss):
 def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler):
     """Single training step.
 
-    :param neox_args: 
-    :param timers: 
-    :param data_iterator: 
-    :param model: 
-    :param optimizer: 
-    :param lr_scheduler: 
+    :param neox_args:
+    :param timers:
+    :param data_iterator:
+    :param model:
+    :param optimizer:
+    :param lr_scheduler:
 
     """
 
@@ -582,10 +582,10 @@ def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler)
 def train_step_pipe(neox_args, timers, model, data_iterator):
     """Single training step with DeepSpeed's pipeline parallel engine.
 
-    :param neox_args: 
-    :param timers: 
-    :param model: 
-    :param data_iterator: 
+    :param neox_args:
+    :param timers:
+    :param model:
+    :param data_iterator:
 
     """
 
@@ -616,13 +616,13 @@ def train(
 ):
     """Train the model function.
 
-    :param neox_args: 
-    :param timers: 
-    :param model: 
-    :param optimizer: 
-    :param lr_scheduler: 
-    :param train_data_iterator: 
-    :param valid_data_iterator: 
+    :param neox_args:
+    :param timers:
+    :param model:
+    :param optimizer:
+    :param lr_scheduler:
+    :param train_data_iterator:
+    :param valid_data_iterator:
 
     """
 
@@ -739,10 +739,10 @@ def evaluate(
                     where the size of the array is the model's context size + 1
                     (`get_batch` transforms it into inputs / labels)
 
-    :param neox_args: 
-    :param forward_step_fn: 
-    :param data_iterator: 
-    :param model: 
+    :param neox_args:
+    :param forward_step_fn:
+    :param data_iterator:
+    :param model:
     :param verbose:  (Default value = False)
     :param timers:  (Default value = None)
 
@@ -825,12 +825,12 @@ def evaluate_and_print_results(
 ):
     """Helper function to evaluate and dump results on screen.
 
-    :param neox_args: 
-    :param prefix: 
-    :param forward_step_func: 
-    :param data_iterator: 
-    :param model: 
-    :param iteration: 
+    :param neox_args:
+    :param prefix:
+    :param forward_step_func:
+    :param data_iterator:
+    :param model:
+    :param iteration:
     :param verbose:  (Default value = False)
     :param timers:  (Default value = None)
 
