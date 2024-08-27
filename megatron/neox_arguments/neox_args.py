@@ -926,7 +926,12 @@ class NeoXArgsTraining(NeoXArgsTemplate):
 
     save: str = None
     """
-    Output directory to save checkpoints to.
+    Output directory to save checkpoints to, ephemerally.
+    """
+    
+    store: str = None
+    """
+    Output directory to store checkpoints to, long term.
     """
 
     s3_path: str = None
@@ -978,7 +983,7 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     Additional iterations when a checkpoint should be saved.
     Must be a list of ints or `None`.
     """
-
+    
     no_save_optim: bool = False
     """
     Do not save current optimizer.
