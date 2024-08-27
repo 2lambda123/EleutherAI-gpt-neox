@@ -708,7 +708,7 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     """
     Output directory to save checkpoints to, ephemerally.
     """
-    
+
     store: str = None
     """
     Output directory to store checkpoints to, long term.
@@ -728,7 +728,7 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     """
     Number of iterations between checkpoint saves.
     """
-    
+
     no_save_optim: bool = False
     """
     Do not save current optimizer.
