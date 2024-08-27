@@ -24,10 +24,9 @@ ATTENTION_TYPE_CHOICES = [
 
 
 def get_git_commit_hash():
-    """ Gets the git commit hash of your current repo (if it exists) """
+    """Gets the git commit hash of your current repo (if it exists)"""
     try:
-        git_hash = subprocess.check_output(
-            ["git", "describe", "--always"]).strip()
+        git_hash = subprocess.check_output(["git", "describe", "--always"]).strip()
         git_hash = git_hash.decode()
     except subprocess.CalledProcessError:
         git_hash = None
@@ -125,9 +124,9 @@ class NeoXArgsModel(NeoXArgsTemplate):
     Scalenorm epsilon
     """
 
-    pos_emb: Literal[
-        "learned", "rotary", "sinusoidal", "rpe", "alibi", "none"
-    ] = "learned"
+    pos_emb: Literal["learned", "rotary", "sinusoidal", "rpe", "alibi", "none"] = (
+        "learned"
+    )
     """
     Type of positional embedding to use - choose from 'learned', 'rotary', 'sinusoidal', 'rpe', 'none'
     """
@@ -208,8 +207,7 @@ class NeoXArgsModel(NeoXArgsTemplate):
     Pad the vocab size to be divisible by this value. This is added for computational efficiency reasons.
     """
 
-    activation: Literal["gelu", "geglu", "relu",
-                        "softsign", "swish", "mish"] = "gelu"
+    activation: Literal["gelu", "geglu", "relu", "softsign", "swish", "mish"] = "gelu"
     """
     Activation function to use - choose from ["gelu", "geglu", "relu", "softsign", "swish", "mish"]
     """
@@ -388,8 +386,7 @@ class NeoXArgsLRScheduler(NeoXArgsTemplate):
     LR Scheduler Arguments
     """
 
-    lr_decay_style: Literal["constant", "linear",
-                            "cosine", "exponential"] = "linear"
+    lr_decay_style: Literal["constant", "linear", "cosine", "exponential"] = "linear"
     """
     Learning rate decay function. Choose from 'constant', 'linear', 'cosine', 'exponential'.
     """
