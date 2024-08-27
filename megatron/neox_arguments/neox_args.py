@@ -26,7 +26,8 @@ ATTENTION_TYPE_CHOICES = [
 def get_git_commit_hash():
     """ Gets the git commit hash of your current repo (if it exists) """
     try:
-        git_hash = subprocess.check_output(["git", "describe", "--always"]).strip()
+        git_hash = subprocess.check_output(
+            ["git", "describe", "--always"]).strip()
         git_hash = git_hash.decode()
     except subprocess.CalledProcessError:
         git_hash = None
@@ -207,7 +208,8 @@ class NeoXArgsModel(NeoXArgsTemplate):
     Pad the vocab size to be divisible by this value. This is added for computational efficiency reasons.
     """
 
-    activation: Literal["gelu", "geglu", "relu", "softsign", "swish", "mish"] = "gelu"
+    activation: Literal["gelu", "geglu", "relu",
+                        "softsign", "swish", "mish"] = "gelu"
     """
     Activation function to use - choose from ["gelu", "geglu", "relu", "softsign", "swish", "mish"]
     """
@@ -386,7 +388,8 @@ class NeoXArgsLRScheduler(NeoXArgsTemplate):
     LR Scheduler Arguments
     """
 
-    lr_decay_style: Literal["constant", "linear", "cosine", "exponential"] = "linear"
+    lr_decay_style: Literal["constant", "linear",
+                            "cosine", "exponential"] = "linear"
     """
     Learning rate decay function. Choose from 'constant', 'linear', 'cosine', 'exponential'.
     """
@@ -708,7 +711,7 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     """
     Output directory to save checkpoints to, ephemerally.
     """
-    
+
     store: str = None
     """
     Output directory to store checkpoints to, long term.
@@ -728,7 +731,7 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     """
     Number of iterations between checkpoint saves.
     """
-    
+
     no_save_optim: bool = False
     """
     Do not save current optimizer.

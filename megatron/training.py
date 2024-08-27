@@ -229,22 +229,25 @@ def get_model(neox_args, inference=False, get_key_value=True):
 
     # Build model on cpu.
     model = GPT2ModelPipe(neox_args=neox_args, num_tokentypes=0, parallel_output=True, topology=mpu.get_topology(),
-                            inference=inference, get_key_value=get_key_value)
-    
+                          inference=inference, get_key_value=get_key_value)
+
     ### soft prompt tuning stuff ###
     if neox_args.soft_prompt_tuning is not None and neox_args.soft_prompt_tuning.get('enabled', False):
-        soft_prompt = SoftEmbedding(neox_args, 
-                                    wte = getattr(model, '0').word_embeddings,
-                                    n_tokens=neox_args.soft_prompt_tuning.get("n_tokens", 10),
-                                    init_string=neox_args.soft_prompt_tuning.get("init_string", ""),
+        soft_prompt = SoftEmbedding(neox_args,
+                                    wte=getattr(model, '0').word_embeddings,
+                                    n_tokens=neox_args.soft_prompt_tuning.get(
+                                        "n_tokens", 10),
+                                    init_string=neox_args.soft_prompt_tuning.get(
+                                        "init_string", ""),
                                     init_range=neox_args.soft_prompt_tuning.get("init_range", 0.5))
-        model.insert_layers(layers=soft_prompt, idx=1) # insert the soft prompt layer directly after the word embeddings
-        
+        # insert the soft prompt layer directly after the word embeddings
+        model.insert_layers(layers=soft_prompt, idx=1)
+
         # freeze everything but the soft prompt
         for name, param in model.named_parameters():
             if not 'soft_embedding' in name:
                 param.requires_grad = False
-        
+
     if not neox_args.is_pipe_parallel:
         # Export PipeParallel model to nn.Sequential model to avoid the overhead of deepspeed's pipe parallel training
         model = model.to_sequential()
@@ -266,7 +269,8 @@ def get_optimizer(model, neox_args):
         return None, None
     # Build parameter groups (weight decay and non-decay).
     param_groups = get_params_for_weight_decay_optimization(model, neox_args)
-    print_rank_0(f'Configuring Optimizer type: {neox_args.optimizer_type} with params: {neox_args.optimizer["params"]}')
+    print_rank_0(
+        f'Configuring Optimizer type: {neox_args.optimizer_type} with params: {neox_args.optimizer["params"]}')
 
     # Add model parallel attribute if it is not set.
     for param_group in param_groups:
@@ -277,7 +281,8 @@ def get_optimizer(model, neox_args):
     # Filter out params that don't require a grad (for soft prompt tuning, etc.)
     _param_groups = []
     for param_group in param_groups:
-        trainable_params = [p for p in param_group['params'] if p.requires_grad]
+        trainable_params = [
+            p for p in param_group['params'] if p.requires_grad]
         param_group['params'] = trainable_params
         _param_groups.append(param_group)
     param_groups = _param_groups
@@ -317,7 +322,8 @@ def get_optimizer(model, neox_args):
                 import bitsandbytes as bnb
                 adam_optimizer = bnb.optim.Adam8bit
             except ModuleNotFoundError:
-                print("Please install bitsandbytes following https://github.com/facebookresearch/bitsandbytes.")
+                print(
+                    "Please install bitsandbytes following https://github.com/facebookresearch/bitsandbytes.")
                 raise Exception
         else:
             try:
@@ -325,7 +331,8 @@ def get_optimizer(model, neox_args):
                 from apex.optimizers import FusedAdam as Adam
             except ImportError:
                 # if apex isn't installed, use deepspeed's FusedAdam
-                print("WARNING: APEX not installed - defaulting to deepspeed's fused adam")
+                print(
+                    "WARNING: APEX not installed - defaulting to deepspeed's fused adam")
                 from deepspeed.ops.adam import FusedAdam as Adam
             adam_optimizer = Adam
         optimizer = adam_optimizer(
@@ -334,7 +341,8 @@ def get_optimizer(model, neox_args):
             **neox_args.optimizer["params"],
         )
     else:
-        raise ValueError(f"Optimizer type {neox_args.optimizer_type} not recognized")
+        raise ValueError(
+            f"Optimizer type {neox_args.optimizer_type} not recognized")
 
     if neox_args.deepspeed:
         # fp16 wrapper is not required for DeepSpeed.
@@ -384,7 +392,8 @@ def setup_model_and_optimizer(neox_args, inference=False, get_key_value=True):
         neox_args=neox_args, inference=inference, get_key_value=get_key_value
     )
     optimizer, param_groups = get_optimizer(model=model, neox_args=neox_args)
-    lr_scheduler = get_learning_rate_scheduler(optimizer=optimizer, neox_args=neox_args)
+    lr_scheduler = get_learning_rate_scheduler(
+        optimizer=optimizer, neox_args=neox_args)
 
     if neox_args.deepspeed:
         print_rank_0("DeepSpeed is enabled.")
@@ -563,7 +572,7 @@ def train(
         if neox_args.log_gradient_noise_scale:  # log noise scale if applicable
             noise_scale_logger.update()
 
-        # get learning rate (if present) - if doing soft prompt tuning + pipe parallel, you 
+        # get learning rate (if present) - if doing soft prompt tuning + pipe parallel, you
         # may have no tunable parameters on a specific rank
         if optimizer.param_groups:
             lr = optimizer.param_groups[0].get('lr', 0)
@@ -656,7 +665,8 @@ def evaluate(
             iteration += 1
             if verbose and iteration % neox_args.log_interval == 0:
                 print_rank_0(
-                    "Evaluating iter {}/{}".format(iteration, neox_args.eval_iters)
+                    "Evaluating iter {}/{}".format(iteration,
+                                                   neox_args.eval_iters)
                 )
 
             # although we're not accumulating gradients here, we count one iter as train_batch_size_per_gpu * g.a.s
