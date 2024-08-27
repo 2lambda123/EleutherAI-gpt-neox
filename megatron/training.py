@@ -18,7 +18,6 @@
 #
 # This file has been modified from its original version
 #
-
 """Pretrain utilities."""
 import math
 import sys
@@ -30,19 +29,27 @@ import numpy as np
 import torch
 
 from eval_tasks import run_eval_harness
-from megatron import mpu, print_rank_0
-from megatron.checkpointing import load_checkpoint, save_checkpoint
+from megatron import mpu
+from megatron import print_rank_0
+from megatron.checkpointing import load_checkpoint
+from megatron.checkpointing import save_checkpoint
 from megatron.data.data_utils import build_train_valid_test_data_iterators
 from megatron.initialize import initialize_megatron
 from megatron.learning_rates import AnnealingLR
-from megatron.logging import tb_wandb_log, training_log
-from megatron.model import (GPT2ModelPipe, SoftEmbedding,
-                            get_params_for_weight_decay_optimization)
+from megatron.logging import tb_wandb_log
+from megatron.logging import training_log
+from megatron.model import get_params_for_weight_decay_optimization
+from megatron.model import GPT2ModelPipe
+from megatron.model import SoftEmbedding
 from megatron.model.gpt2_model import cross_entropy
-from megatron.utils import (CharCounter, OverflowMonitor, Timers,
-                            get_ltor_masks_and_position_ids,
-                            get_noise_scale_logger, get_total_params,
-                            init_wandb, reduce_losses)
+from megatron.utils import CharCounter
+from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.utils import get_noise_scale_logger
+from megatron.utils import get_total_params
+from megatron.utils import init_wandb
+from megatron.utils import OverflowMonitor
+from megatron.utils import reduce_losses
+from megatron.utils import Timers
 
 
 def pretrain(neox_args):
