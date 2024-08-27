@@ -47,15 +47,14 @@ from megatron.utils import (CharCounter, OverflowMonitor, Timers,
 
 def pretrain(neox_args):
     """Main training program.
-
+    
     This function will run the followings in the order provided:
         1) initialize Megatron.
         2) setup model, optimizer and lr schedule
         3) call train_val_test_data_provider to get train/val/test datasets.
         4) train the model.
 
-    Arguments:
-        neox_args: an instance of NeoXArgs containing the configuration for pretrain
+    :param neox_args: an instance of NeoXArgs containing the configuration for pretrain
 
     """
     # setup logging and timers
@@ -138,7 +137,15 @@ def pretrain(neox_args):
 
 
 def _get_batch(neox_args, tokenizer, keys, data, datatype):
-    """Support function for get_batch / get_batch pipe (to avoid code repetition)"""
+    """Support function for get_batch / get_batch pipe (to avoid code repetition)
+
+    :param neox_args: 
+    :param tokenizer: 
+    :param keys: 
+    :param data: 
+    :param datatype: 
+
+    """
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
@@ -155,7 +162,12 @@ def _get_batch(neox_args, tokenizer, keys, data, datatype):
 
 
 def get_batch(neox_args, data_iterator):
-    """Generate a batch"""
+    """Generate a batch
+
+    :param neox_args: 
+    :param data_iterator: 
+
+    """
 
     # Items and their type.
     keys = ["text"]
@@ -176,7 +188,12 @@ def get_batch(neox_args, data_iterator):
 
 
 def get_batch_pipe(data, neox_args):
-    """A modification of get_batch() to work with the latest batch instead of an iterator."""
+    """A modification of get_batch() to work with the latest batch instead of an iterator.
+
+    :param data: 
+    :param neox_args: 
+
+    """
     # Items and their type.
     keys = ["text"]
     datatype = torch.int64
@@ -189,7 +206,15 @@ def get_batch_pipe(data, neox_args):
 
 
 def forward_step(data_iterator, model, neox_args, timers, return_logits=False):
-    """Forward step."""
+    """Forward step.
+
+    :param data_iterator: 
+    :param model: 
+    :param neox_args: 
+    :param timers: 
+    :param return_logits:  (Default value = False)
+
+    """
     if neox_args.is_pipe_parallel:
         return model.eval_batch(data_iterator, return_logits=return_logits)
 
@@ -212,7 +237,13 @@ def forward_step(data_iterator, model, neox_args, timers, return_logits=False):
 
 
 def get_model(neox_args, inference=False, get_key_value=True):
-    """Build the model."""
+    """Build the model.
+
+    :param neox_args: 
+    :param inference:  (Default value = False)
+    :param get_key_value:  (Default value = True)
+
+    """
 
     print_rank_0("building GPT2 model ...")
 
@@ -261,7 +292,12 @@ def get_model(neox_args, inference=False, get_key_value=True):
 
 
 def get_optimizer(model, neox_args):
-    """Set up the optimizer."""
+    """Set up the optimizer.
+
+    :param model: 
+    :param neox_args: 
+
+    """
     if neox_args.no_load_optim:
         return None, None
     # Build parameter groups (weight decay and non-decay).
@@ -351,7 +387,12 @@ def get_optimizer(model, neox_args):
 
 
 def get_learning_rate_scheduler(optimizer, neox_args):
-    """Build the learning rate scheduler."""
+    """Build the learning rate scheduler.
+
+    :param optimizer: 
+    :param neox_args: 
+
+    """
     if neox_args.no_load_optim:
         # TODO: this should be configured as a separate arg
         return None
@@ -386,7 +427,13 @@ def get_learning_rate_scheduler(optimizer, neox_args):
 
 
 def setup_model_and_optimizer(neox_args, inference=False, get_key_value=True):
-    """Setup model and optimizer."""
+    """Setup model and optimizer.
+
+    :param neox_args: 
+    :param inference:  (Default value = False)
+    :param get_key_value:  (Default value = True)
+
+    """
     model = get_model(
         neox_args=neox_args, inference=inference, get_key_value=get_key_value
     )
@@ -440,7 +487,15 @@ def setup_model_and_optimizer(neox_args, inference=False, get_key_value=True):
 
 
 def backward_step(neox_args, timers, optimizer, model, loss):
-    """Backward step."""
+    """Backward step.
+
+    :param neox_args: 
+    :param timers: 
+    :param optimizer: 
+    :param model: 
+    :param loss: 
+
+    """
 
     # Backward pass.
     timers("backward-backward").start()
@@ -459,7 +514,16 @@ def backward_step(neox_args, timers, optimizer, model, loss):
 
 
 def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler):
-    """Single training step."""
+    """Single training step.
+
+    :param neox_args: 
+    :param timers: 
+    :param data_iterator: 
+    :param model: 
+    :param optimizer: 
+    :param lr_scheduler: 
+
+    """
 
     # Pipeline parallelism schedules forward/backward/step
     if neox_args.is_pipe_parallel:
@@ -509,7 +573,14 @@ def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler)
 
 
 def train_step_pipe(neox_args, timers, model, data_iterator):
-    """Single training step with DeepSpeed's pipeline parallel engine."""
+    """Single training step with DeepSpeed's pipeline parallel engine.
+
+    :param neox_args: 
+    :param timers: 
+    :param model: 
+    :param data_iterator: 
+
+    """
 
     assert neox_args.deepspeed
     loss = model.train_batch(data_iter=data_iterator)
@@ -536,7 +607,17 @@ def train(
     train_data_iterator,
     valid_data_iterator,
 ):
-    """Train the model function."""
+    """Train the model function.
+
+    :param neox_args: 
+    :param timers: 
+    :param model: 
+    :param optimizer: 
+    :param lr_scheduler: 
+    :param train_data_iterator: 
+    :param valid_data_iterator: 
+
+    """
 
     # Turn on training mode which enables dropout.
     model.train()
@@ -650,6 +731,14 @@ def evaluate(
                     {'text': np.array([tokens], dtype=np.int64)}
                     where the size of the array is the model's context size + 1
                     (`get_batch` transforms it into inputs / labels)
+
+    :param neox_args: 
+    :param forward_step_fn: 
+    :param data_iterator: 
+    :param model: 
+    :param verbose:  (Default value = False)
+    :param timers:  (Default value = None)
+
     """
     # Turn on evaluation mode which disables dropout.
     model.eval()
@@ -727,7 +816,18 @@ def evaluate_and_print_results(
     verbose=False,
     timers=None,
 ):
-    """Helper function to evaluate and dump results on screen."""
+    """Helper function to evaluate and dump results on screen.
+
+    :param neox_args: 
+    :param prefix: 
+    :param forward_step_func: 
+    :param data_iterator: 
+    :param model: 
+    :param iteration: 
+    :param verbose:  (Default value = False)
+    :param timers:  (Default value = None)
+
+    """
     total_loss_dict = evaluate(
         neox_args=neox_args,
         forward_step_fn=forward_step_func,

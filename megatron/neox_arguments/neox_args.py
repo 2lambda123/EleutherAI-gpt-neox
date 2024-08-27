@@ -35,9 +35,7 @@ def get_git_commit_hash():
 
 @dataclass
 class NeoXArgsParallelism(NeoXArgsTemplate):
-    """
-    Parallelism Arguments
-    """
+    """Parallelism Arguments"""
 
     pipe_parallel_size: int = 0
     """
@@ -70,9 +68,7 @@ class NeoXArgsParallelism(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsModel(NeoXArgsTemplate):
-    """
-    Model Arguments
-    """
+    """Model Arguments"""
 
     precision: Literal["fp16", "fp32", "bfloat16"] = None
     """
@@ -333,9 +329,7 @@ class NeoXArgsModel(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsOptimizer(NeoXArgsTemplate):
-    """
-    Optimizer Arguments
-    """
+    """Optimizer Arguments"""
 
     optimizer_type: Literal[
         "adam", "onebitadam", "cpu_adam", "cpu_torch_adam", "sm3", "madgrad_wd"
@@ -382,9 +376,7 @@ class NeoXArgsOptimizer(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsLRScheduler(NeoXArgsTemplate):
-    """
-    LR Scheduler Arguments
-    """
+    """LR Scheduler Arguments"""
 
     lr_decay_style: Literal["constant", "linear", "cosine", "exponential"] = "linear"
     """
@@ -419,9 +411,7 @@ class NeoXArgsLRScheduler(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsLogging(NeoXArgsTemplate):
-    """
-    Logging Arguments
-    """
+    """Logging Arguments"""
 
     use_wandb: bool = None
     """Flag indicating if wandb is to be used."""
@@ -496,9 +486,7 @@ class NeoXArgsLogging(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsOther(NeoXArgsTemplate):
-    """
-    Misc. Arguments
-    """
+    """Misc. Arguments"""
 
     distributed_backend: str = "nccl"
     """
@@ -601,9 +589,7 @@ class NeoXArgsOther(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsTokenizer(NeoXArgsTemplate):
-    """
-    Tokenizer Arguments
-    """
+    """Tokenizer Arguments"""
 
     tokenizer_type: Literal[
         "GPT2BPETokenizer", "HFTokenizer", "HFGPT2Tokenizer", "CharLevelTokenizer"
@@ -626,9 +612,7 @@ class NeoXArgsTokenizer(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsTraining(NeoXArgsTemplate):
-    """
-    Training Arguments
-    """
+    """Training Arguments"""
 
     data_path: str = None
     """
@@ -902,9 +886,7 @@ class NeoXArgsTraining(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsTextgen(NeoXArgsTemplate):
-    """
-    Text Generation arguments
-    """
+    """Text Generation arguments"""
 
     text_gen_type: str = None
     """
