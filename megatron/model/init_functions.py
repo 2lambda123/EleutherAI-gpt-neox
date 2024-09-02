@@ -98,7 +98,8 @@ def _orthogonal(tensor, gain=1):
 def orthogonal_init_method(n_layers=1, use_mup=False, mup_init_scale=1.0):
     """Fills the input Tensor with a (semi) orthogonal matrix, as described in
     Exact solutions to the nonlinear dynamics of learning in deep linear neural networks - Saxe, A. et al. (2013)
-    Optionally scaling by number of layers possible, as introduced in OBST - Nestler et. al. (2021, to be released)"""
+    Optionally scaling by number of layers possible, as introduced in OBST - Nestler et. al. (2021, to be released)
+    """
 
     if use_mup:
         raise ValueError(
@@ -113,7 +114,8 @@ def orthogonal_init_method(n_layers=1, use_mup=False, mup_init_scale=1.0):
 
 def xavier_uniform_init_method(use_mup_outer=False, mup_init_scale=1.0):
     """Fills the input Tensor with values according to the method described in Understanding the difficulty of
-    training deep feedforward neural networks - Glorot, X. & Bengio, Y. (2010), using a uniform distribution."""
+    training deep feedforward neural networks - Glorot, X. & Bengio, Y. (2010), using a uniform distribution.
+    """
 
     def init_(tensor, use_mup=use_mup_outer):
         if use_mup:
@@ -129,7 +131,8 @@ def xavier_uniform_init_method(use_mup_outer=False, mup_init_scale=1.0):
 
 def xavier_normal_init_method(use_mup_outer=False, mup_init_scale=1.0):
     """Fills the input Tensor with values according to the method described in Understanding the difficulty of
-    training deep feedforward neural networks - Glorot, X. & Bengio, Y. (2010), using a normal distribution."""
+    training deep feedforward neural networks - Glorot, X. & Bengio, Y. (2010), using a normal distribution.
+    """
 
     def init_(tensor, use_mup=use_mup_outer):
         if use_mup:
@@ -145,7 +148,8 @@ def xavier_normal_init_method(use_mup_outer=False, mup_init_scale=1.0):
 
 def small_init_init_method(dim, use_mup_outer=False, mup_init_scale=1.0):
     """Fills the input Tensor with values according to the method described in Transformers without Tears: Improving
-    the Normalization of Self-Attention - Nguyen, T. & Salazar, J. (2019), using a normal distribution."""
+    the Normalization of Self-Attention - Nguyen, T. & Salazar, J. (2019), using a normal distribution.
+    """
     std = math.sqrt(2 / (5 * dim))
 
     def init_(tensor, use_mup=use_mup_outer):

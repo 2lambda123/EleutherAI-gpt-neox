@@ -345,7 +345,6 @@ def expand_attention_types(attention_config, num_layers):
 
 
 class OverflowMonitor:
-
     """
     Checks if the past n iterations have been skipped due to overflow, and exits
     training if that happens.

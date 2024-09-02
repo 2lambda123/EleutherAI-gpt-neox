@@ -21,6 +21,7 @@ except ModuleNotFoundError:
 from megatron.model.norms import get_norm
 from megatron import mpu
 
+
 # Mamba sublayer, with tensor parallelism
 class ParallelMambaBlock(nn.Module):
     def __init__(
@@ -264,9 +265,11 @@ class ParallelMambaBlock(nn.Module):
                 self.conv1d.weight,
                 # for some bizarre reason this becomes fp32 sometime after init, when A and D held in fp32.
                 # cast it manually if the bias exists
-                self.conv1d.bias.to(self.precision)
-                if self.conv1d.bias is not None
-                else self.conv1d.bias,
+                (
+                    self.conv1d.bias.to(self.precision)
+                    if self.conv1d.bias is not None
+                    else self.conv1d.bias
+                ),
                 self.x_proj.weight,
                 self.dt_proj.weight,
                 self.out_proj.weight,
@@ -303,9 +306,11 @@ class ParallelMambaBlock(nn.Module):
             x = causal_conv1d_fn(
                 x=x,
                 weight=einops.rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                bias=self.conv1d.bias.to(self.precision)
-                if self.conv1d.bias is not None
-                else self.conv1d.bias,
+                bias=(
+                    self.conv1d.bias.to(self.precision)
+                    if self.conv1d.bias is not None
+                    else self.conv1d.bias
+                ),
                 activation="silu",
             )
 

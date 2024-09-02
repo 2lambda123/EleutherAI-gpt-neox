@@ -455,7 +455,7 @@ class EvalHarnessAdapter(HFLM):
             print(f"Using cache at {use_cache}...")
             lm = lm_eval.api.model.CachingLM(
                 lm,
-                use_cache
+                use_cache,
                 # each rank receives a different cache db.
                 # necessary to avoid multiple writes to cache at once
                 # TODO: Append a subset of `neox_args` to the cache database

@@ -132,9 +132,11 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
             layers=self.specs,
             loss_fn=partial(cross_entropy, _fp16=self.neox_args.fp16_lm_cross_entropy),
             topology=topology,
-            activation_checkpoint_interval=self.neox_args.checkpoint_num_layers
-            if self.neox_args.checkpoint_activations
-            else 0,
+            activation_checkpoint_interval=(
+                self.neox_args.checkpoint_num_layers
+                if self.neox_args.checkpoint_activations
+                else 0
+            ),
             partition_method=neox_args.pipe_partition_method,
             checkpointable_layers=[
                 "GMLPBlock",

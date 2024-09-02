@@ -32,5 +32,4 @@ NeoX args can be instantiated with the following options
 * refer to docstrings in code for more information
 """
 
-
 from .arguments import NeoXArgs
