@@ -1,6 +1,7 @@
 """
 Helper functions for performing coord check.
 """
+
 import os
 from copy import copy
 from itertools import product

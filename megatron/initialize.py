@@ -226,7 +226,6 @@ def _set_random_seed(seed):
 
 
 def _write_args_to_tensorboard(neox_args):
-
     """Write arguments to tensorboard."""
     if neox_args.tensorboard_writer:
         for arg_name in vars(neox_args):

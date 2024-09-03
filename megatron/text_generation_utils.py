@@ -338,9 +338,9 @@ def stream_tokens(
                     ).view(-1)
 
                 if neox_args.return_logits:
-                    generation_logits[
-                        token_index_to_generate - 1
-                    ] = generated_token_logits[0]
+                    generation_logits[token_index_to_generate - 1] = (
+                        generated_token_logits[0]
+                    )
 
             if neox_args.is_pipe_parallel:
                 # broadcast generated tokens to pipe parallel group
